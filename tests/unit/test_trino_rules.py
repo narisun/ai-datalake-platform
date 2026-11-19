@@ -75,6 +75,14 @@ def test_higher_ceiling_reaches_more_tables() -> None:
     assert set(_grants(_build(), "role_steward_sales")) == {"dim_customer", "stg_customers"}
 
 
+def test_a_hidden_schema_is_granted_to_no_role() -> None:
+    document = _build("hidden_schemas: [analytics_staging]\n" + POLICY)
+
+    assert set(_grants(document, "role_steward_sales")) == {"dim_customer"}
+    # The pipeline still owns the whole catalog.
+    assert document["tables"][-2]["user"] == "svc_pipeline"
+
+
 def test_sensitive_columns_are_hidden_and_masks_applied() -> None:
     columns = _grants(_build(), "role_analyst_sales")["dim_customer"]["columns"]
 
@@ -154,3 +162,44 @@ def test_mask_on_something_that_does_not_exist_is_an_error(target: str, message:
 def test_role_names_that_are_unsafe_as_trino_users_are_rejected(name: str) -> None:
     with pytest.raises(PolicyError, match="role name"):
         trino_user_for(name)
+
+
+def test_catalog_user_reads_everything_in_the_lake_and_changes_nothing() -> None:
+    document = build_trino_rules(
+        rules=parse_access_rules(POLICY),
+        datasets=DATASETS,
+        catalog="lake",
+        service_user="svc_datalake",
+        pipeline_user="svc_pipeline",
+        catalog_user="svc_catalog",
+    )
+
+    tables = document["tables"]
+    assert tables[-1] == {"privileges": []}
+    assert tables[-2] == {"user": "svc_catalog", "catalog": "lake", "privileges": ["SELECT"]}
+    assert tables[-3]["user"] == "svc_pipeline"
+    assert {"user": "svc_catalog", "catalog": "lake", "allow": "read-only"} in document["catalogs"]
+    # It is not a role, so the app can never act as it.
+    pattern = re.compile(document["impersonation"][0]["new_user"])
+    assert not pattern.fullmatch("svc_catalog")
+
+
+def test_pipeline_may_let_others_read_its_views() -> None:
+    pipeline = next(
+        rule
+        for rule in _build()["tables"]
+        if rule.get("user") == "svc_pipeline" and rule["catalog"] == "lake"
+    )
+
+    assert "GRANT_SELECT" in pipeline["privileges"]
+
+
+def test_only_the_pipeline_reads_the_system_catalog() -> None:
+    document = _build()
+
+    system_tables = [rule for rule in document["tables"] if rule.get("catalog") == "system"]
+    system_catalogs = [rule for rule in document["catalogs"] if rule.get("catalog") == "system"]
+    assert system_tables == [
+        {"user": "svc_pipeline", "catalog": "system", "privileges": ["SELECT"]}
+    ]
+    assert system_catalogs == [{"user": "svc_pipeline", "catalog": "system", "allow": "read-only"}]

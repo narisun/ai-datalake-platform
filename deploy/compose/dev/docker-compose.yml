@@ -38,7 +38,6 @@ services:
       AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD}
       POLARIS_DB_PASSWORD: ${POLARIS_DB_PASSWORD}
       CONTROL_DB_PASSWORD: ${CONTROL_DB_PASSWORD}
-      SHOP_DB_PASSWORD: ${SHOP_DB_PASSWORD}
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
@@ -130,24 +129,71 @@ services:
       timeout: 5s
       retries: 20
 
+  # Trino will not start without a rules file. Until the pipeline has generated the
+  # real one, this puts a starting file in place that lets only the pipeline and the
+  # catalog reader in. It never overwrites an existing file.
+  rules-init:
+    image: datalake/airflow:dev
+    build:
+      context: ../../..
+      dockerfile: deploy/compose/dev/airflow/Dockerfile
+    entrypoint:
+      - bash
+      - -c
+      - cp -n /initial-rules.json /opt/datalake/work/trino-rules.json
+    volumes:
+      - ./trino/initial-rules.json:/initial-rules.json:ro
+      - datalake-work:/opt/datalake/work
+
+  # Makes Trino's TLS certificate (first start only) and its password file (every
+  # start). See trino/init_auth.py.
+  trino-auth-init:
+    image: datalake/airflow:dev
+    build:
+      context: ../../..
+      dockerfile: deploy/compose/dev/airflow/Dockerfile
+    user: "0"
+    entrypoint: ["python", "/init_auth.py"]
+    environment:
+      TRINO_PIPELINE_PASSWORD: ${TRINO_PIPELINE_PASSWORD:?run init_env.py again}
+      TRINO_CATALOG_PASSWORD: ${TRINO_CATALOG_PASSWORD:?run init_env.py again}
+      TRINO_APP_PASSWORD: ${TRINO_APP_PASSWORD:?run init_env.py again}
+    volumes:
+      - ./trino/init_auth.py:/init_auth.py:ro
+      - trino-tls:/tls
+      - trino-auth:/auth
+
   trino:
     image: trinodb/trino:484
     environment:
       POLARIS_CLIENT_ID: ${POLARIS_CLIENT_ID}
       POLARIS_CLIENT_SECRET: ${POLARIS_CLIENT_SECRET}
-      SHOP_DB_PASSWORD: ${SHOP_DB_PASSWORD}
+      TRINO_SHARED_SECRET: ${TRINO_SHARED_SECRET:?run init_env.py again}
     volumes:
       - ./trino/catalog:/etc/trino/catalog:ro
+      - ./trino/config.properties:/etc/trino/config.properties:ro
+      - ./trino/access-control.properties:/etc/trino/access-control.properties:ro
+      - ./trino/password-authenticator.properties:/etc/trino/password-authenticator.properties:ro
+      - trino-tls:/etc/trino/tls:ro
+      - trino-auth:/etc/trino/auth:ro
+      # The generated access rules, written by the pipeline's access_rules task.
+      - datalake-work:/etc/trino/rules:ro
       - lake:/data/lake
     ports:
-      - "8090:8080"
+      - "8443:8443"
     depends_on:
+      trino-auth-init:
+        condition: service_completed_successfully
+      rules-init:
+        condition: service_completed_successfully
       lake-init:
         condition: service_completed_successfully
       polaris:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "trino", "--execute", "select 1"]
+      # Healthy once Trino answers on its HTTPS port. (The image has no grep to look
+      # further into the reply.)
+      test: ["CMD", "curl", "-skf", "-o", "/dev/null", "https://localhost:8443/v1/info"]
       interval: 15s
       timeout: 10s
       retries: 20
@@ -160,6 +206,22 @@ services:
       - azurite-data:/data
     ports:
       - "10000:10000"
+
+  # Text embeddings and reranking for the agent's search, on CPU. The dev defaults are
+  # small English models that download quickly; set the two variables in .env to use
+  # the production choices (BAAI/bge-m3 and BAAI/bge-reranker-v2-m3). Changing the
+  # embedding model changes the vector size, so the search index must be rebuilt.
+  tei-embed:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+    command: ["--model-id", "${TEI_EMBED_MODEL:-BAAI/bge-small-en-v1.5}", "--port", "80"]
+    volumes:
+      - tei-models:/data
+
+  tei-rerank:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+    command: ["--model-id", "${TEI_RERANK_MODEL:-BAAI/bge-reranker-base}", "--port", "80"]
+    volumes:
+      - tei-models:/data
 
   openmetadata-migrate:
     image: docker.getcollate.io/openmetadata/server:2.0.8
@@ -207,10 +269,21 @@ services:
       # The one setting the platform takes from the environment.
       DL_DATABASE_URL: postgresql://datalake:${CONTROL_DB_PASSWORD}@postgres:5432/datalake_control
       DL_STRICT_CONFIG: "1"
+      # Secrets created at run time (OpenMetadata's bot token) are kept as files here.
+      DL_SECRETS_DIR: /opt/datalake/work/secrets
+      # For the agent's model calls. Empty unless set in .env or the shell.
+      DL_SECRET_ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       # Used only by bootstrap.py, to set the stack up the first time.
       POLARIS_CLIENT_ID: ${POLARIS_CLIENT_ID}
       POLARIS_CLIENT_SECRET: ${POLARIS_CLIENT_SECRET}
-      SHOP_DB_PASSWORD: ${SHOP_DB_PASSWORD}
+      # Azurite's account key is a fixed, public value built into the emulator. It is
+      # passed as a secret anyway, so the configuration looks as it will on Azure.
+      # Secrets the platform resolves from `${secret:...}` references in its configuration.
+      DL_SECRET_TRINO_PIPELINE_PASSWORD: ${TRINO_PIPELINE_PASSWORD}
+      DL_SECRET_TRINO_APP_PASSWORD: ${TRINO_APP_PASSWORD}
+      # Used by bootstrap.py for OpenMetadata's own Trino connection.
+      TRINO_CATALOG_PASSWORD: ${TRINO_CATALOG_PASSWORD}
+      DL_SECRET_AZURITE_KEY: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
     entrypoint: /bin/bash
     command: ["/opt/airflow/ingestion_dependency.sh"]
     volumes:
@@ -219,6 +292,9 @@ services:
       - ./dags:/opt/airflow/dags/platform:ro
       - ./scripts:/opt/datalake/dev:ro
       - ../../../dbt:/opt/datalake/dbt:ro
+      - ../../../ingest:/opt/datalake/ingest:ro
+      # The certificate to trust when connecting to Trino (not its private key).
+      - trino-tls:/etc/trino-tls:ro
       - datalake-work:/opt/datalake/work
     ports:
       - "8080:8080"
@@ -232,6 +308,9 @@ services:
 
 volumes:
   postgres-data:
+  tei-models:
+  trino-tls:
+  trino-auth:
   opensearch-data:
   lake:
   azurite-data:

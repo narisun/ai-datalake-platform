@@ -19,7 +19,8 @@ from datalake.core.errors import PolicyError
 from datalake.policy.model import AccessRules, RoleRule
 
 _ROLE_NAME = re.compile(r"[a-z][a-z0-9_]*")
-_PIPELINE_PRIVILEGES = ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP"]
+# GRANT_SELECT lets other users read the views the pipeline creates over its tables.
+_PIPELINE_PRIVILEGES = ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"]
 
 
 def trino_user_for(role: str) -> str:
@@ -38,31 +39,48 @@ def build_trino_rules(
     catalog: str,
     service_user: str,
     pipeline_user: str,
+    catalog_user: str | None = None,
 ) -> dict[str, Any]:
     """Build the rules document.
 
-    `service_user` is the SDK app: it may only impersonate role users.
-    `pipeline_user` is dbt and ingestion: it owns the catalog.
+    `service_user` is the platform's app: it may only impersonate role users.
+    `pipeline_user` is dbt and ingestion: it owns the lake catalog.
+    `catalog_user`, if given, is the metadata catalog's reader (OpenMetadata): it may
+    read every table's definition and data in the lake, and change nothing.
     """
     _check_masks(rules, datasets)
     roles = [rules.roles[name] for name in sorted(rules.roles)]
     role_users = [trino_user_for(role.name) for role in roles]
+    readers = [re.escape(user) for user in role_users]
+    if catalog_user is not None:
+        readers.append(re.escape(catalog_user))
 
     table_rules: list[dict[str, Any]] = []
     for role in roles:
         for dataset in sorted(datasets, key=lambda d: (d.schema, d.name)):
-            rule = _table_rule(role, dataset, catalog)
+            rule = _table_rule(role, dataset, catalog, rules.hidden_schemas)
             if rule is not None:
                 table_rules.append(rule)
+    # dbt reads table comments from Trino's built-in `system` catalog.
+    table_rules.append(
+        {"user": re.escape(pipeline_user), "catalog": "system", "privileges": ["SELECT"]}
+    )
     table_rules.append(
         {"user": re.escape(pipeline_user), "catalog": catalog, "privileges": _PIPELINE_PRIVILEGES}
     )
+    if catalog_user is not None:
+        table_rules.append(
+            {"user": re.escape(catalog_user), "catalog": catalog, "privileges": ["SELECT"]}
+        )
     table_rules.append({"privileges": []})
 
     catalog_rules: list[dict[str, Any]] = [
-        {"user": re.escape(user), "catalog": catalog, "allow": "read-only"} for user in role_users
+        {"user": user, "catalog": catalog, "allow": "read-only"} for user in readers
     ]
     catalog_rules.append({"user": re.escape(pipeline_user), "catalog": catalog, "allow": "all"})
+    catalog_rules.append(
+        {"user": re.escape(pipeline_user), "catalog": "system", "allow": "read-only"}
+    )
     catalog_rules.append({"allow": "none"})
 
     impersonation: list[dict[str, Any]] = []
@@ -87,8 +105,12 @@ def build_trino_rules(
     }
 
 
-def _table_rule(role: RoleRule, dataset: Dataset, catalog: str) -> dict[str, Any] | None:
+def _table_rule(
+    role: RoleRule, dataset: Dataset, catalog: str, hidden_schemas: frozenset[str]
+) -> dict[str, Any] | None:
     """SELECT on one table for one role, or None if the role may not see the table."""
+    if dataset.schema in hidden_schemas:
+        return None
     if dataset.domain not in role.domains or dataset.classification > role.max_classification:
         return None
 

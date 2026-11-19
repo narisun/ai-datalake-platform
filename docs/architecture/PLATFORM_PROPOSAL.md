@@ -285,7 +285,7 @@ dbt links to them; it does not create them. The catalog task **fails** if OpenMe
 
 | Command | Job | Run by |
 |---|---|---|
-| `dl ingest` | Load sources into the raw layer | Airflow |
+| `dl ingest` | Load landing files (CSV, Excel, Parquet) into the raw layer, through Trino | Airflow |
 | `dl transform` | Run dbt on Trino | Airflow |
 | `dl access-rules` | Generate Trino's access rules | Airflow |
 | `dl index` | Build the agent's search index from OpenMetadata | Airflow |
@@ -452,6 +452,10 @@ Run on a developer machine with the stack in `deploy/compose/spike/`: OpenMetada
 | D9 | Agentic processes in the first release | **Level 2**, with one level 3 pilot |
 | D10 | Accept OpenMetadata's ingestion code under the Collate Community License (source-available, not OSI open source) | ✅ **Accepted** 2026-11-19. Internal use only; the platform must never be offered as a service that competes with Collate. |
 | D11 | Build and run everything in containers first; in that phase the lake is a shared Docker volume and all containers run on one machine | ✅ **Accepted** 2026-11-19. ADLS Gen2 and the two-VM split follow by configuration (§7.4). |
+| D12 | First sources are files (CSV, Excel, Parquet) dropped into a landing container. The ingest process parses them and writes the raw layer **through Trino**, not with dlt | ✅ **Accepted** 2026-11-19. Trino is the only writer to the lake, so it is the only component needing lake storage access. dlt remains the plan for APIs and databases. |
+| D13 | The reference dbt project has a canonical layer (`customer`, `sales_order`) between staging and marts, with enforced contracts | Built and tested 2026-11-19, following the recommendation in D8. **Not yet explicitly confirmed by the team.** |
+| D14 | Trino requires password sign-in over TLS. Only service accounts have passwords; roles are reached by the platform's account acting as them | Built and tested in the dev stack 2026-11-19. This is the mechanism §6 describes for running each query as the caller's role. |
+| D15 | Level-1 agent is a fixed workflow (search → one SQL query → run as the role → answer, one retry), not a tool-calling loop. A role that may read above `agent_max_classification` (default confidential) cannot use it, because query results are sent to the hosted model | Built 2026-11-19; tested live with a scripted model, **not yet with a real model call** (no API key on the dev machine). MCP server, Chainlit and the `usage` table are not built. |
 
 ---
 

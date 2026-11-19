@@ -6,12 +6,8 @@ import pytest
 
 from datalake.agent.model import AgentEvent, ChatMessage, QueryResult
 from datalake.agent.testing import FakeQueryEngine, ScriptedAgentRuntime, ScriptedChatModel
-from datalake.catalog.testing import InMemoryMetadataCatalog
-from datalake.core.catalog import Dataset, LineageEdge, Term
 from datalake.core.errors import NotFoundError
 from datalake.core.security import Principal
-from datalake.ingest.model import IngestResult
-from datalake.ingest.testing import FakeIngestor
 from datalake.search.model import Query
 from datalake.search.testing import HashingEmbedder, InMemoryLexicalIndex, InMemoryVectorIndex
 from datalake.storage.testing import InMemoryObjectStore, InMemoryTableCatalog
@@ -45,25 +41,6 @@ async def test_table_catalog() -> None:
     assert not await catalog.table_exists("marts", "missing")
 
 
-async def test_metadata_catalog_lineage_and_lookup() -> None:
-    catalog = InMemoryMetadataCatalog()
-    await catalog.upsert_datasets(
-        [Dataset("urn:stg", "stg_orders", "sales"), Dataset("urn:fct", "fct_orders", "sales")]
-    )
-    await catalog.upsert_terms([Term("Customer", synonyms=("client",))])
-    await catalog.add_lineage([LineageEdge("urn:stg", "urn:fct")])
-
-    assert (await catalog.get_dataset("urn:fct")).name == "fct_orders"
-    assert [d.urn for d in await catalog.list_datasets()] == ["urn:fct", "urn:stg"]
-    assert (await catalog.get_term("Customer")).synonyms == ("client",)
-    assert await catalog.upstream("urn:fct") == ["urn:stg"]
-    assert await catalog.downstream("urn:stg") == ["urn:fct"]
-    with pytest.raises(NotFoundError):
-        await catalog.get_dataset("urn:none")
-    with pytest.raises(NotFoundError):
-        await catalog.get_term("Nope")
-
-
 async def test_indexes_rank_upsert_and_delete() -> None:
     lexical = InMemoryLexicalIndex()
     vector = InMemoryVectorIndex(HashingEmbedder())
@@ -81,16 +58,11 @@ async def test_indexes_rank_upsert_and_delete() -> None:
     assert [h.chunk.chunk_id for h in await vector.search(Query("revenue"), 10)] == ["b"]
 
 
-async def test_pipeline_fakes_record_calls() -> None:
-    ingestor = FakeIngestor({"crm": IngestResult("crm", ("customers",), 10)})
+async def test_transform_fake_records_selections() -> None:
     engine = FakeTransformEngine(models=["stg_orders", "fct_orders"])
 
-    assert (await ingestor.ingest("crm")).rows_loaded == 10
-    with pytest.raises(NotFoundError):
-        await ingestor.ingest("unknown")
     assert (await engine.build()).models_built == ("stg_orders", "fct_orders")
     assert (await engine.build("fct_orders")).models_built == ("fct_orders",)
-    assert ingestor.ingested == ["crm", "unknown"]
     assert engine.selections == [None, "fct_orders"]
 
 

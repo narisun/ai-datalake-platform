@@ -3,18 +3,29 @@ version: "0.1.0"
 profile: datalake
 
 model-paths: ["models"]
+test-paths: ["tests"]
 
-# Every model must say which business domain it belongs to and how sensitive it is.
-# The SDK reads these to build Trino access rules and the search filter. A model with
-# no domain is visible to nobody, and one with no classification is treated as restricted.
+# Layers
+#   staging    text from the raw layer made typed and de-duplicated. Rows that cannot be
+#              typed are kept and marked with a reject_reason; nothing is silently lost.
+#   canonical  one agreed version of each business entity. Only valid rows. Contracts
+#              fix the column names and types that everything downstream relies on.
+#   marts      analytical tables built from the canonical layer.
+#
+# Every model must say which business domain it belongs to and how sensitive it is
+# (see models/staging/staging.yml for the rules). `dl check-tags` enforces this.
 models:
   datalake:
     staging:
       +schema: staging
       +materialized: view
-    marts:
-      +schema: marts
+    canonical:
+      +schema: canonical
       +materialized: table
       # Replace the table in one atomic step. The default (rename the old table away,
       # then drop it) is slower on Iceberg and loses the table's history.
+      +on_table_exists: replace
+    marts:
+      +schema: marts
+      +materialized: table
       +on_table_exists: replace

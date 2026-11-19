@@ -11,7 +11,14 @@ from typing import Any, cast
 import psycopg
 
 from datalake.control.errors import ProcessNotRegisteredError
-from datalake.control.model import ConfigEntry, Process, RunRecord, RunStart, RunStatus
+from datalake.control.model import (
+    ConfigEntry,
+    IngestedFile,
+    Process,
+    RunRecord,
+    RunStart,
+    RunStatus,
+)
 
 _VERSION_TABLE = """
 create table if not exists public.control_schema_version (
@@ -241,6 +248,54 @@ class PostgresControlStore:
             """,
             (process_id, object_name, value),
         )
+
+    # File ledger
+
+    def get_ingested_file(self, process_id: int, source: str, path: str) -> IngestedFile | None:
+        row = self._connection.execute(
+            """
+            select source, path, content_hash, status, rows_loaded, error, run_id::text
+            from control.ingested_file
+            where process_id = %s and source = %s and path = %s
+            """,
+            (process_id, source, path),
+        ).fetchone()
+        return IngestedFile(*row) if row else None
+
+    def record_ingested_file(self, process_id: int, file: IngestedFile) -> None:
+        self._connection.execute(
+            """
+            insert into control.ingested_file
+                (process_id, source, path, content_hash, status, rows_loaded, error, run_id)
+            values (%s, %s, %s, %s, %s, %s, %s, %s)
+            on conflict (process_id, source, path) do update set
+                content_hash = excluded.content_hash, status = excluded.status,
+                rows_loaded = excluded.rows_loaded, error = excluded.error,
+                run_id = excluded.run_id, recorded_at = now()
+            """,
+            (
+                process_id,
+                file.source,
+                file.path,
+                file.content_hash,
+                file.status,
+                file.rows_loaded,
+                file.error,
+                file.run_id,
+            ),
+        )
+
+    def list_ingested_files(self, process_id: int, source: str | None) -> Sequence[IngestedFile]:
+        rows = self._connection.execute(
+            """
+            select source, path, content_hash, status, rows_loaded, error, run_id::text
+            from control.ingested_file
+            where process_id = %s and (%s::text is null or source = %s)
+            order by source, path
+            """,
+            (process_id, source, source),
+        ).fetchall()
+        return [IngestedFile(*row) for row in rows]
 
     # For tests and operators
 

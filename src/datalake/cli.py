@@ -24,11 +24,16 @@ from datalake.control.command import run_external
 from datalake.control.errors import ConfigError, ProcessNotRegisteredError
 from datalake.control.ports import ControlStore
 from datalake.control.postgres import apply_migrations
+from datalake.control.runtime import SystemClock
+from datalake.control.service import Control
 from datalake.core.errors import DatalakeError
+from datalake.ingest.service import IngestDependencies, IngestSettings, run_ingest
 from datalake.policy.policy_file import load_access_rules
 from datalake.policy.trino_rules import build_trino_rules
+from datalake.search.indexing import IndexDependencies, SearchSettings, run_index
 from datalake.transform.command import DocsEngine, TransformSettings, run_transform
 from datalake.transform.dbt_manifest import read_manifest
+from datalake.transform.tag_check import check_manifest_file
 
 _ENV_PREFIX = "DL_"
 # Bootstrap settings stay in the environment; they are never moved to the database.
@@ -79,6 +84,22 @@ def _build_parser() -> argparse.ArgumentParser:
     runs.add_argument("--process")
     runs.add_argument("--limit", type=int, default=20)
 
+    # dl ingest / dl files
+    ingest = commands.add_parser("ingest", help="load new and changed landing files")
+    ingest.add_argument("--source", help="load one source only")
+    files = commands.add_parser("files", help="show what ingestion did with each file")
+    files.add_argument("--source")
+
+    # dl index / dl search
+    commands.add_parser("index", help="bring the agent's search index in step with the catalog")
+    search = commands.add_parser("search", help="search the catalog as a role would see it")
+    search.add_argument("--role", required=True, help="a role from access.yml")
+    search.add_argument("--limit", type=int, default=5)
+    search.add_argument("text")
+    ask = commands.add_parser("ask", help="ask a question about the data, as a role")
+    ask.add_argument("--role", required=True, help="a role from access.yml")
+    ask.add_argument("question")
+
     # dl transform / dl exec
     commands.add_parser("transform", help="build the dbt project as the 'transform' process")
     exec_ = commands.add_parser(
@@ -86,6 +107,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     exec_.add_argument("process")
     exec_.add_argument("cmd", nargs=argparse.REMAINDER, metavar="-- COMMAND")
+
+    # dl check-tags
+    check = commands.add_parser(
+        "check-tags", help="check every dbt model has a domain, owner and classification"
+    )
+    check.add_argument("--manifest", type=Path, required=True, help="dbt manifest.json")
 
     # dl policy
     policy = commands.add_parser("policy", help="work with the access policy").add_subparsers(
@@ -98,6 +125,7 @@ def _build_parser() -> argparse.ArgumentParser:
     trino.add_argument("--catalog", default="lake", help="Trino catalog holding the lake")
     trino.add_argument("--service-user", default="svc_datalake", help="the platform's Trino user")
     trino.add_argument("--pipeline-user", default="svc_pipeline", help="dbt and ingestion user")
+    trino.add_argument("--catalog-user", help="the metadata catalog's read-only Trino user")
     trino.add_argument("--out", type=Path, help="write here instead of standard output")
     return parser
 
@@ -124,14 +152,36 @@ def _policy(args: argparse.Namespace) -> int:
         catalog=args.catalog,
         service_user=args.service_user,
         pipeline_user=args.pipeline_user,
+        catalog_user=args.catalog_user,
     )
     text = json.dumps(document, indent=2) + "\n"
     if args.out is None:
         sys.stdout.write(text)
     else:
-        args.out.write_text(text, encoding="utf-8")
-        print(f"wrote {args.out}: {len(document['tables']) - 2} table grant(s)")
+        # Trino re-reads this file while it runs, so it must never see half of it:
+        # write beside it, then swap in one step.
+        staging = args.out.with_name(args.out.name + ".tmp")
+        staging.write_text(text, encoding="utf-8")
+        staging.replace(args.out)
+        grants = sum(1 for rule in document["tables"] if "table" in rule)
+        print(f"wrote {args.out}: {grants} table grant(s)")
     return 0
+
+
+def _check_tags(manifest: Path) -> int:
+    problems = check_manifest_file(manifest)
+    models = sum(
+        1
+        for node in json.loads(manifest.read_text(encoding="utf-8")).get("nodes", {}).values()
+        if node.get("resource_type") == "model"
+    )
+    if not problems:
+        print(f"{manifest}: {models} model(s) checked, all tagged correctly")
+        return 0
+    for problem in problems:
+        print(problem)
+    print(f"{len(problems)} problem(s) in {models} model(s)", file=sys.stderr)
+    return 1
 
 
 # --- control --------------------------------------------------------------------------
@@ -215,6 +265,180 @@ def _runs(args: argparse.Namespace, store: ControlStore) -> int:
     return 0
 
 
+def _ingest_dependencies(settings: IngestSettings) -> IngestDependencies:
+    # Imported here so that `dl` works without these libraries for every other command.
+    from datalake.ingest.sources_file import load_sources
+    from datalake.ingest.trino_writer import TrinoRawTableWriter
+    from datalake.storage.obstore_store import ObstoreObjectStore, create_landing_store
+
+    return IngestDependencies(
+        sources=load_sources(settings.sources_file),
+        landing=ObstoreObjectStore(
+            create_landing_store(
+                account=settings.landing_account,
+                container=settings.landing_container,
+                endpoint=settings.landing_endpoint,
+                account_key=settings.landing_account_key,
+                managed_identity_client_id=settings.landing_client_id,
+            )
+        ),
+        writer=TrinoRawTableWriter(
+            host=settings.trino_host,
+            port=settings.trino_port,
+            user=settings.trino_user,
+            catalog=settings.trino_catalog,
+            scheme=settings.trino_scheme,
+            password=settings.trino_password,
+            ca_file=str(settings.trino_ca_file) if settings.trino_ca_file else None,
+        ),
+    )
+
+
+def _files(args: argparse.Namespace, store: ControlStore) -> int:
+    process = store.find_process("ingest")
+    if process is None:
+        raise ProcessNotRegisteredError("ingest")
+    for file in store.list_ingested_files(process.process_id, args.source):
+        rows = "" if file.rows_loaded is None else f"{file.rows_loaded} rows"
+        line = f"{file.status:<10}  {file.source:<14}  {file.path}  {rows}".rstrip()
+        print(f"{line}  {file.error}" if file.error else line)
+    return 0
+
+
+async def _index(control: Control) -> int:
+    # Imported here so that `dl` works without these libraries for every other command.
+    import httpx
+
+    from datalake.catalog.openmetadata import OpenMetadataCatalog
+    from datalake.search.opensearch import OpenSearchChunkIndex
+    from datalake.search.tei import TeiEmbedder
+
+    async with httpx.AsyncClient(timeout=120) as http:
+
+        def build(settings: SearchSettings) -> IndexDependencies:
+            return IndexDependencies(
+                catalog=OpenMetadataCatalog(
+                    http,
+                    settings.openmetadata_url,
+                    settings.openmetadata_token,
+                    settings.catalog_service,
+                ),
+                store=OpenSearchChunkIndex(
+                    http,
+                    settings.opensearch_url,
+                    settings.search_index,
+                    TeiEmbedder(http, settings.embed_url),
+                ),
+                hidden_schemas=load_access_rules(settings.access_policy_file).hidden_schemas,
+            )
+
+        summary = await run_index(control, build)
+    print(
+        f"index succeeded: {summary.total} chunk(s); {summary.written} written, "
+        f"{summary.deleted} removed, {summary.unchanged} unchanged"
+    )
+    return 0
+
+
+async def _search(control: Control, role: str, text: str, limit: int) -> int:
+    import httpx
+
+    from datalake.core.security import Principal
+    from datalake.policy.service import RoleAccessPolicy
+    from datalake.search.opensearch import OpenSearchChunkIndex, VectorSearch
+    from datalake.search.retriever import HybridRetriever
+    from datalake.search.tei import TeiEmbedder, TeiReranker
+
+    # A search is recorded as a run of the `agent` process: who asked, as which role.
+    with control.start("agent") as run:
+        settings = run.config(SearchSettings)
+        rules = load_access_rules(settings.access_policy_file)
+        if role not in rules.roles:
+            raise ConfigError(f"no role named {role!r} in {settings.access_policy_file}")
+        async with httpx.AsyncClient(timeout=120) as http:
+            index = OpenSearchChunkIndex(
+                http,
+                settings.opensearch_url,
+                settings.search_index,
+                TeiEmbedder(http, settings.embed_url),
+            )
+            retriever = HybridRetriever(
+                lexical=index,
+                vector=VectorSearch(index),
+                reranker=TeiReranker(http, settings.rerank_url),
+                policy=RoleAccessPolicy(rules),
+                final_n=limit,
+            )
+            with run.step("search") as step:
+                passages = await retriever.retrieve(text, Principal(role, frozenset({role})))
+                step.rows_read = len(passages)
+    if not passages:
+        print("nothing found that this role may see")
+    for rank, passage in enumerate(passages, start=1):
+        first_line = passage.chunk.text.splitlines()[0]
+        print(f"{rank}. {passage.score:6.3f}  {first_line}")
+    return 0
+
+
+async def _ask(control: Control, role: str, question: str) -> int:
+    import anthropic
+    import httpx
+
+    from datalake.agent.asking import AgentDependencies, AgentSettings, run_ask
+    from datalake.agent.claude import AnthropicChatModel
+    from datalake.agent.graph import LangGraphAgent
+    from datalake.agent.model import AgentEvent
+    from datalake.agent.trino_query import TrinoQueryEngine
+    from datalake.policy.service import RoleAccessPolicy
+    from datalake.search.opensearch import OpenSearchChunkIndex, VectorSearch
+    from datalake.search.retriever import HybridRetriever
+    from datalake.search.tei import TeiEmbedder, TeiReranker
+
+    def show(event: AgentEvent) -> None:
+        if event.kind == "status":
+            print(f"... {event.text}", file=sys.stderr)
+        elif event.kind == "sql":
+            print(f"\n{event.text}\n", file=sys.stderr)
+
+    async with httpx.AsyncClient(timeout=120) as http:
+
+        def build(settings: AgentSettings) -> AgentDependencies:
+            if not settings.anthropic_api_key.strip():
+                raise ConfigError("anthropic_api_key is empty; set ANTHROPIC_API_KEY for the stack")
+            rules = load_access_rules(settings.access_policy_file)
+            index = OpenSearchChunkIndex(
+                http,
+                settings.opensearch_url,
+                settings.search_index,
+                TeiEmbedder(http, settings.embed_url),
+            )
+            retriever = HybridRetriever(
+                lexical=index,
+                vector=VectorSearch(index),
+                reranker=TeiReranker(http, settings.rerank_url),
+                policy=RoleAccessPolicy(rules),
+            )
+            model = AnthropicChatModel(
+                anthropic.AsyncAnthropic(api_key=settings.anthropic_api_key),
+                model=settings.agent_model,
+                effort=settings.agent_effort,
+            )
+            engine = TrinoQueryEngine(
+                host=settings.trino_host,
+                port=settings.trino_port,
+                account=settings.agent_trino_user,
+                password=settings.agent_trino_password,
+                scheme=settings.trino_scheme,
+                ca_file=str(settings.trino_ca_file) if settings.trino_ca_file else None,
+            )
+            runtime = LangGraphAgent(retriever, model, engine, max_rows=settings.agent_max_rows)
+            return AgentDependencies(rules=rules, runtime=runtime)
+
+        answer = await run_ask(control, build, question, role, on_event=show)
+    print(answer.text)
+    return 0
+
+
 def _dbt_engine(settings: TransformSettings, run_id: str) -> DocsEngine:
     # Imported here so that `dl` works without dbt installed for every other command.
     from datalake.transform.dbt_core_runner import DbtCoreRunner
@@ -240,6 +464,8 @@ def main(
     try:
         if args.command == "policy":
             return _policy(args)
+        if args.command == "check-tags":
+            return _check_tags(args.manifest)
 
         env = environment if environment is not None else load_environment()
         if args.command == "db":
@@ -248,9 +474,36 @@ def main(
             return 0
 
         control_store = store if store is not None else open_store(env)
+        if args.command == "ingest":
+            summary = asyncio.run(
+                run_ingest(
+                    build_control(env, control_store),
+                    _ingest_dependencies,
+                    SystemClock(),
+                    only=args.source,
+                )
+            )
+            print(
+                f"ingest succeeded: {summary.count('loaded')} file(s) loaded, "
+                f"{summary.rows_loaded} row(s); {summary.count('unchanged')} unchanged, "
+                f"{summary.count('superseded')} superseded"
+            )
+            return 0
+        if args.command == "index":
+            return asyncio.run(_index(build_control(env, control_store)))
+        if args.command == "search":
+            return asyncio.run(
+                _search(build_control(env, control_store), args.role, args.text, args.limit)
+            )
+        if args.command == "ask":
+            return asyncio.run(_ask(build_control(env, control_store), args.role, args.question))
+        if args.command == "files":
+            return _files(args, control_store)
         if args.command == "transform":
             result = asyncio.run(run_transform(build_control(env, control_store), _dbt_engine))
             print(f"transform succeeded: {len(result.models_built)} model(s) built")
+            for warning in result.warnings:
+                print(f"  warning: {warning}")
             return 0
         if args.command == "exec":
             command = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd

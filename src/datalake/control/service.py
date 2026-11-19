@@ -9,7 +9,7 @@ from pydantic import BaseModel
 
 from datalake.control.config import ConfigResolver
 from datalake.control.errors import ProcessDisabledError, ProcessNotRegisteredError
-from datalake.control.model import Process, RunStart
+from datalake.control.model import FileStatus, IngestedFile, Process, RunStart
 from datalake.control.ports import Clock, ControlStore, IdGenerator
 
 
@@ -83,6 +83,24 @@ class RunContext:
     def set_watermark(self, object_name: str, value: str) -> None:
         """Call only after the work up to `value` has succeeded."""
         self._store.set_watermark(self.process.process_id, object_name, value)
+
+    def ingested_file(self, source: str, path: str) -> IngestedFile | None:
+        """What an earlier run recorded for this file, if anything."""
+        return self._store.get_ingested_file(self.process.process_id, source, path)
+
+    def record_file(
+        self,
+        source: str,
+        path: str,
+        content_hash: str,
+        status: FileStatus,
+        rows_loaded: int | None = None,
+        error: str | None = None,
+    ) -> None:
+        self._store.record_ingested_file(
+            self.process.process_id,
+            IngestedFile(source, path, content_hash, status, rows_loaded, error, self.run_id),
+        )
 
 
 class Control:

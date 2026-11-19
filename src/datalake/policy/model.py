@@ -49,6 +49,9 @@ class AccessRules:
     """The whole access policy: every role and what it grants."""
 
     roles: Mapping[str, RoleRule]
+    # Schemas no role may read and search never shows, whatever their tables' tags say.
+    # For working layers (staging) that only the pipeline should touch.
+    hidden_schemas: frozenset[str] = frozenset()
 
     def search_filter(self, principal: Principal) -> SearchFilter:
         """Combine the caller's roles. Roles unknown to the policy grant nothing."""

@@ -34,7 +34,16 @@ async def test_reference_project_parses_and_every_model_is_tagged(manifest_path:
     manifest = read_manifest(manifest_path)
     models = {d.name: d for d in manifest.datasets if d.urn.startswith("model.")}
 
-    assert set(models) == {"stg_orders", "stg_customers", "dim_customer", "fct_orders"}
+    assert set(models) == {
+        "stg_orders",
+        "stg_customers",
+        "rejected_rows",
+        "customer",
+        "sales_order",
+        "dim_customer",
+        "fct_orders",
+        "agg_daily_revenue",
+    }
     assert all(model.domain == "sales" for model in models.values())
     assert models["stg_customers"].classification is Classification.CONFIDENTIAL
     email = next(c for c in models["dim_customer"].columns if c.name == "email")
@@ -45,8 +54,10 @@ async def test_lineage_runs_from_sources_to_marts(manifest_path: Path) -> None:
     edges = {(e.upstream_urn, e.downstream_urn) for e in read_manifest(manifest_path).lineage}
 
     assert ("source.datalake.raw.orders", "model.datalake.stg_orders") in edges
-    assert ("model.datalake.stg_orders", "model.datalake.fct_orders") in edges
-    assert ("model.datalake.dim_customer", "model.datalake.fct_orders") in edges
+    assert ("model.datalake.stg_orders", "model.datalake.sales_order") in edges
+    assert ("model.datalake.sales_order", "model.datalake.fct_orders") in edges
+    assert ("model.datalake.customer", "model.datalake.fct_orders") in edges
+    assert ("model.datalake.fct_orders", "model.datalake.agg_daily_revenue") in edges
 
 
 async def test_cli_generates_trino_rules_for_the_reference_project(
@@ -70,9 +81,22 @@ async def test_cli_generates_trino_rules_for_the_reference_project(
     assert code == 0
     tables = json.loads(out.read_text(encoding="utf-8"))["tables"]
     analyst = {r["table"]: r for r in tables if r.get("user") == "role_analyst_sales"}
-    # Confidential staging table is out of reach; email and name are hidden in the mart.
-    assert set(analyst) == {"stg_orders", "dim_customer", "fct_orders"}
+    # Staging is a hidden schema; email and name are hidden in the mart.
+    assert set(analyst) == {
+        "customer",
+        "sales_order",
+        "dim_customer",
+        "fct_orders",
+        "agg_daily_revenue",
+    }
     assert analyst["dim_customer"]["columns"] == [
         {"name": "full_name", "allow": False},
         {"name": "email", "allow": False},
     ]
+
+
+async def test_reference_project_passes_the_tag_check(
+    manifest_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["check-tags", "--manifest", str(manifest_path)]) == 0
+    assert "8 model(s) checked, all tagged correctly" in capsys.readouterr().out

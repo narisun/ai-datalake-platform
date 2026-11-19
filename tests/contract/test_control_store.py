@@ -15,7 +15,7 @@ import psycopg
 import pytest
 
 from datalake.control.errors import ProcessNotRegisteredError
-from datalake.control.model import RunStart
+from datalake.control.model import IngestedFile, RunStart
 from datalake.control.ports import ControlStore
 from datalake.control.postgres import PostgresControlStore, apply_migrations
 from datalake.control.testing import InMemoryControlStore
@@ -45,7 +45,7 @@ def store(request: pytest.FixtureRequest) -> Iterator[InspectableStore]:
     with psycopg.connect(url, autocommit=True) as admin:
         admin.execute("drop schema if exists control cascade")
         admin.execute("drop table if exists public.control_schema_version")
-    assert apply_migrations(url) == [1]
+    assert apply_migrations(url) == [1, 2]
     assert apply_migrations(url) == []  # running again changes nothing
     postgres = PostgresControlStore.connect(url)
     yield postgres
@@ -222,3 +222,39 @@ def test_watermarks_are_per_process_and_object(store: InspectableStore) -> None:
     assert store.get_watermark(ingest.process_id, "orders") == "2026-11-19"
     assert store.get_watermark(ingest.process_id, "customers") == "42"
     assert store.get_watermark(transform.process_id, "orders") is None
+
+
+# --- file ledger ----------------------------------------------------------------------
+
+
+def test_file_ledger_records_replaces_and_lists(store: InspectableStore) -> None:
+    ingest = store.register_process("ingest")
+    other = store.register_process("transform")
+    store.start_run(RunStart(_run_id(1), ingest.process_id, T0))
+
+    assert store.get_ingested_file(ingest.process_id, "orders", "a.csv") is None
+
+    first = IngestedFile("orders", "a.csv", "hash1", "loaded", 10, None, _run_id(1))
+    store.record_ingested_file(ingest.process_id, first)
+    store.record_ingested_file(
+        ingest.process_id, IngestedFile("orders", "b.csv", "hash2", "rejected", None, "bad header")
+    )
+    store.record_ingested_file(
+        ingest.process_id, IngestedFile("customers", "c.xlsx", "hash3", "loaded", 3)
+    )
+    assert store.get_ingested_file(ingest.process_id, "orders", "a.csv") == first
+
+    corrected = IngestedFile("orders", "a.csv", "hash9", "loaded", 12, None, _run_id(1))
+    store.record_ingested_file(ingest.process_id, corrected)
+
+    assert store.get_ingested_file(ingest.process_id, "orders", "a.csv") == corrected
+    assert [f.path for f in store.list_ingested_files(ingest.process_id, None)] == [
+        "c.xlsx",
+        "a.csv",
+        "b.csv",
+    ]
+    assert [f.path for f in store.list_ingested_files(ingest.process_id, "orders")] == [
+        "a.csv",
+        "b.csv",
+    ]
+    assert store.list_ingested_files(other.process_id, None) == []

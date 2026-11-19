@@ -1,0 +1,41 @@
+# The files the platform ingests. One entry per kind of file.
+#
+#   landing_prefix    folder in the landing container, ending in /
+#   pattern           which file names in that folder to take (default: all)
+#   table             where the rows go: <schema>.<table> in the lake
+#   format            csv | excel | parquet
+#   mode              append   every file's rows are kept; re-uploading a file under the
+#                              same name replaces that file's rows only
+#                     replace  each file is a full snapshot; the newest file by name
+#                              replaces the whole table
+#   required_columns  reject a file that lacks any of these (names as normalised:
+#                     lower-case snake_case)
+#   csv only          delimiter (default ","), encoding (default utf-8)
+#   excel only        sheet (default: the first sheet)
+#
+# Every value is loaded as text. The dbt staging models do the typing.
+
+sources:
+  - name: orders
+    landing_prefix: shop/orders/
+    pattern: "orders_*.csv"
+    table: raw.orders
+    format: csv
+    mode: append
+    required_columns: [order_id, customer_id, ordered_at, amount]
+
+  - name: customers
+    landing_prefix: shop/customers/
+    pattern: "*.xlsx"
+    table: raw.customers
+    format: excel
+    mode: replace
+    required_columns: [customer_id, full_name, email, country]
+
+  - name: products
+    landing_prefix: shop/products/
+    pattern: "*.parquet"
+    table: raw.products
+    format: parquet
+    mode: replace
+    required_columns: [product_id]

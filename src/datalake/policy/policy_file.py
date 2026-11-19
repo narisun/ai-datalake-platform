@@ -46,6 +46,7 @@ class _PolicyModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     roles: dict[str, _RoleModel] = Field(min_length=1)
+    hidden_schemas: list[str] = []
 
 
 def _to_mask(mask: _MaskModel) -> ColumnMask:
@@ -80,7 +81,7 @@ def parse_access_rules(text: str) -> AccessRules:
             max_classification=Classification.parse(role.max_classification),
             masks=masks,
         )
-    return AccessRules(roles)
+    return AccessRules(roles, frozenset(policy.hidden_schemas))
 
 
 def load_access_rules(path: Path) -> AccessRules:

@@ -9,7 +9,8 @@ It does what cannot be expressed in the Compose file:
   1. creates the control schema, registers the processes and sets their configuration
   2. creates the `lake` catalog in Polaris
   3. creates in OpenMetadata what dbt can only link to: tags, domain, glossary, team
-  4. writes OpenMetadata's ingestion workflow files and ingests the sample source
+  4. writes OpenMetadata's ingestion workflow files
+  5. creates the landing container and uploads sample files
 """
 
 from __future__ import annotations
@@ -33,15 +34,36 @@ PROCESSES = {
     "transform": "Build and test the dbt project",
     "access-rules": "Generate Trino access rules from the policy",
     "catalog-sync": "Refresh OpenMetadata from Trino, dbt and Airflow",
+    "index": "Keep the agent's search index in step with the catalog",
+    "agent": "Searches and questions asked through the platform",
 }
 
 CONFIG = {
     "trino_host": "trino",
-    "trino_port": "8080",
+    "trino_port": "8443",
+    "trino_scheme": "https",
+    # References, not values: resolved from DL_SECRET_* at run time.
+    "trino_password": "${secret:trino-pipeline-password}",
+    "trino_ca_file": "/etc/trino-tls/ca.crt",
     "trino_catalog": "lake",
     "dbt_project_dir": "/opt/datalake/dbt",
     "dbt_target_dir": str(WORK / "target"),
     "dbt_log_dir": str(WORK / "logs"),
+    "sources_file": "/opt/datalake/ingest/sources.yml",
+    "access_policy_file": "/opt/datalake/dbt/access.yml",
+    "openmetadata_url": OPENMETADATA,
+    # Written by this script to DL_SECRETS_DIR, because OpenMetadata creates it.
+    "openmetadata_token": "${secret:openmetadata-token}",
+    "opensearch_url": "http://opensearch:9200",
+    "embed_url": "http://tei-embed",
+    "rerank_url": "http://tei-rerank",
+    # The agent signs in to Trino as the platform's account and acts as the asker's role.
+    "agent_trino_password": "${secret:trino-app-password}",
+    "anthropic_api_key": "${secret:anthropic-api-key}",
+    "landing_container": "landing",
+    "landing_endpoint": "http://azurite:10000/devstoreaccount1",
+    # A reference, not the value: resolved from DL_SECRET_AZURITE_KEY at run time.
+    "landing_account_key": "${secret:azurite-key}",
 }
 
 CLASSIFICATIONS = {
@@ -164,39 +186,40 @@ def openmetadata() -> None:
             "synonyms": ["client", "account holder"],
         },
     )
+    put(
+        "glossaryTerms",
+        {
+            "name": "Order",
+            "glossary": "Business",
+            "description": "A customer's request to buy, with its total.",
+            "synonyms": ["sale", "purchase"],
+        },
+    )
     put("teams", {"name": "sales-data", "displayName": "Sales Data", "teamType": "Group"})
 
     write_workflows(token)
-    print("== ingest the sample source into openmetadata")
-    subprocess.run(["metadata", "ingest", "-c", str(WORK / "ingest_shop.yaml")], check=True)
+    secrets_dir = Path(os.environ["DL_SECRETS_DIR"])
+    secrets_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    token_file = secrets_dir / "openmetadata-token"
+    token_file.write_text(token, encoding="utf-8")
+    token_file.chmod(0o600)
+    print(f"  wrote the catalog token to {token_file}")
 
 
 def write_workflows(token: str) -> None:
     """OpenMetadata's ingestion workflow files, used by the nightly pipeline."""
     target = WORK / "target"
     sources: dict[str, dict[str, object]] = {
-        "shop": {
-            "type": "postgres",
-            "serviceName": "shop_db",
-            "serviceConnection": {
-                "config": {
-                    "type": "Postgres",
-                    "username": "shop",
-                    "authType": {"password": os.environ["SHOP_DB_PASSWORD"]},
-                    "hostPort": "postgres:5432",
-                    "database": "shop",
-                }
-            },
-            "sourceConfig": {"config": {"type": "DatabaseMetadata"}},
-        },
         "trino": {
             "type": "trino",
             "serviceName": "lake_trino",
             "serviceConnection": {
                 "config": {
                     "type": "Trino",
-                    "hostPort": "trino:8080",
+                    "hostPort": "trino:8443",
                     "username": "svc_catalog",
+                    "authType": {"password": os.environ["TRINO_CATALOG_PASSWORD"]},
+                    "verify": "/etc/trino-tls/ca.crt",
                     "catalog": "lake",
                 }
             },
@@ -273,9 +296,16 @@ def wait_for(url: str, name: str) -> None:
     raise SystemExit(f"{name} did not become ready at {url}")
 
 
+def landing() -> None:
+    print("== landing container and sample files")
+    python = "/opt/datalake/venv/bin/python"
+    subprocess.run([python, "/opt/datalake/dev/landing.py", "seed"], check=True)
+
+
 if __name__ == "__main__":
     wait_for(f"{OPENMETADATA}/v1/system/version", "OpenMetadata")
     control()
     polaris()
     openmetadata()
+    landing()
     print("== done. Trigger the `nightly` pipeline in Airflow (http://localhost:8080).")

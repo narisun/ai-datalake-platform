@@ -1,13 +1,29 @@
 # Access policy: the single source for who may see what.
 # Roles are Entra ID app roles carried in the user's token.
 # Classification order: public < internal < confidential < restricted
+#
+# A role sees a table when the table's domain is listed and its classification is at
+# or below the role's ceiling. A column above the ceiling is hidden. A mask replaces a
+# column's value with an expression, for a role that may see the column at all.
+# Working layers. No role may read these and the agent's search never shows them,
+# whatever their tables are tagged. Only the pipeline touches them.
+hidden_schemas: [analytics_staging]
+
 roles:
+  # Everyday analysis: no personal data.
   analyst_sales:
     domains: [sales]
     max_classification: internal
+
+  # Customer support: may see who a customer is, but only part of the email address.
+  support_sales:
+    domains: [sales]
+    max_classification: confidential
     masks:
+      - column: customer.email
+        expression: "regexp_replace(email, '^[^@]+', '***')"
       - column: dim_customer.email
-        expression: "'***'"
+        expression: "regexp_replace(email, '^[^@]+', '***')"
 
   steward_finance:
     domains: [finance, sales]

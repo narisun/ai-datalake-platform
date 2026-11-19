@@ -30,18 +30,32 @@ def _control(store: InMemoryControlStore) -> Control:
 
 
 class FakeDbt:
-    def __init__(self, build_ok: bool = True, docs_ok: bool = True) -> None:
+    def __init__(
+        self,
+        build_ok: bool = True,
+        docs_ok: bool = True,
+        build_problems: tuple[str, ...] = (),
+        stale: tuple[str, ...] = (),
+    ) -> None:
         self._build_ok = build_ok
         self._docs_ok = docs_ok
+        self._build_problems = build_problems
+        self._stale = stale
         self.calls: list[str] = []
 
     async def docs(self) -> RunResult:
         self.calls.append("docs")
         return RunResult(self._docs_ok, (), "target")
 
+    async def freshness(self) -> RunResult:
+        self.calls.append("freshness")
+        return RunResult(not self._stale, (), "target", problems=self._stale)
+
     async def build(self, select: str | None = None) -> RunResult:
         self.calls.append("build")
-        return RunResult(self._build_ok, ("stg_orders", "fct_orders"), "target")
+        return RunResult(
+            self._build_ok, ("stg_orders", "fct_orders"), "target", problems=self._build_problems
+        )
 
 
 @pytest.fixture
@@ -74,7 +88,7 @@ async def test_transform_runs_docs_before_build_and_records_both(
 
     result = await run_transform(_control(store), factory)
 
-    assert dbt.calls == ["docs", "build"]
+    assert dbt.calls == ["docs", "freshness", "build"]
     assert result.models_built == ("stg_orders", "fct_orders")
     settings, run_id = seen[0]
     assert settings.dbt_project_dir == Path("/opt/dbt")
@@ -84,8 +98,29 @@ async def test_transform_runs_docs_before_build_and_records_both(
     assert details["status"] == "succeeded"
     assert [(s["name"], s["status"], s["rows_written"]) for s in details["steps"]] == [
         ("docs", "succeeded", None),
+        ("freshness", "succeeded", None),
         ("build", "succeeded", 2),
     ]
+
+
+def test_dbt_gets_sign_in_settings_only_when_configured() -> None:
+    base = {
+        "dbt_project_dir": "/p",
+        "dbt_target_dir": "/t",
+        "dbt_log_dir": "/l",
+        "trino_host": "trino",
+    }
+
+    plain = TransformSettings.model_validate(base).dbt_environment()
+    signed_in = TransformSettings.model_validate(
+        {**base, "trino_password": "pw", "trino_ca_file": "/tls/ca.crt", "trino_scheme": "https"}
+    ).dbt_environment()
+
+    assert "TRINO_PASSWORD" not in plain
+    assert "TRINO_CERT" not in plain
+    assert signed_in["TRINO_PASSWORD"] == "pw"
+    assert signed_in["TRINO_SCHEME"] == "https"
+    assert signed_in["TRINO_CERT"].replace("\\", "/") == "/tls/ca.crt"
 
 
 async def test_failed_build_fails_the_run(store: InMemoryControlStore) -> None:
@@ -94,7 +129,44 @@ async def test_failed_build_fails_the_run(store: InMemoryControlStore) -> None:
 
     (run,) = store.list_runs("transform", 5)
     assert run.status == "failed"
-    assert store.run_details(run.run_id)["steps"][1]["status"] == "failed"
+    assert store.run_details(run.run_id)["steps"][2]["status"] == "failed"
+
+
+async def test_failure_message_names_what_failed(store: InMemoryControlStore) -> None:
+    dbt = FakeDbt(
+        build_ok=False,
+        build_problems=(
+            "unique_customer_customer_id: fail: Got 1 result",
+            "fct_orders: error: boom",
+        ),
+    )
+
+    with pytest.raises(TransformFailedError) as caught:
+        await run_transform(_control(store), lambda settings, run_id: dbt)
+
+    message = str(caught.value)
+    assert "unique_customer_customer_id: fail: Got 1 result" in message
+    assert "fct_orders: error: boom" in message
+    (run,) = store.list_runs("transform", 5)
+    assert run.error is not None
+    assert "unique_customer_customer_id" in run.error
+
+
+async def test_stale_source_still_builds_but_fails_the_run(store: InMemoryControlStore) -> None:
+    dbt = FakeDbt(stale=("orders: error: last loaded 2026-11-01",))
+
+    with pytest.raises(TransformFailedError, match="sources are stale: orders: error"):
+        await run_transform(_control(store), lambda settings, run_id: dbt)
+
+    assert dbt.calls == ["docs", "freshness", "build"]
+    (run,) = store.list_runs("transform", 5)
+    steps = store.run_details(run.run_id)["steps"]
+    assert [(s["name"], s["status"]) for s in steps] == [
+        ("docs", "succeeded"),
+        ("freshness", "succeeded"),
+        ("build", "succeeded"),
+    ]
+    assert run.status == "failed"
 
 
 async def test_failed_docs_stops_before_build(store: InMemoryControlStore) -> None:

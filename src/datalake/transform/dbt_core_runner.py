@@ -19,6 +19,8 @@ from datalake.core.errors import DatalakeError
 from datalake.transform.model import RunResult
 
 _BUILT = {"success", "pass"}
+_FAILED = {"error", "fail", "runtime error"}
+_WARNED = {"warn"}
 
 
 class DbtRunError(DatalakeError):
@@ -59,6 +61,10 @@ class DbtCoreRunner:
         """Write catalog.json. Run this before `build`: it overwrites run_results.json."""
         return await self._invoke(["docs", "generate"])
 
+    async def freshness(self) -> RunResult:
+        """Check how recently each source received data. Stale sources are `problems`."""
+        return await self._invoke(["source", "freshness"])
+
     async def parse(self) -> RunResult:
         """Write manifest.json without connecting to the warehouse."""
         return await self._invoke(["parse"])
@@ -93,6 +99,8 @@ class DbtCoreRunner:
             success=bool(outcome.success),
             models_built=_models_built(outcome.result),
             artifacts_dir=str(self._target_dir),
+            problems=_findings(outcome.result, _FAILED),
+            warnings=_findings(outcome.result, _WARNED),
         )
 
     def _run(self, args: list[str]) -> Any:
@@ -118,3 +126,20 @@ def _models_built(result: Any) -> tuple[str, ...]:
         if str(getattr(item, "status", "")).lower() in _BUILT:
             names.append(str(getattr(node, "name", "")))
     return tuple(names)
+
+
+def _findings(result: Any, statuses: set[str]) -> tuple[str, ...]:
+    """One readable line per result in the given statuses: `name: status: first line`."""
+    lines: list[str] = []
+    for item in getattr(result, "results", None) or ():
+        status = str(getattr(item, "status", "")).lower()
+        if status not in statuses:
+            continue
+        node = getattr(item, "node", None)
+        name = str(getattr(node, "name", "") or getattr(item, "unique_id", "unknown"))
+        message = str(getattr(item, "message", "") or "").strip().splitlines()
+        detail = message[0].strip() if message else ""
+        if not detail and getattr(item, "max_loaded_at", None) is not None:
+            detail = f"last loaded {item.max_loaded_at}"
+        lines.append(f"{name}: {status}" + (f": {detail}" if detail else ""))
+    return tuple(lines)

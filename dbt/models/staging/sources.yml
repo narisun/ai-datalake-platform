@@ -2,10 +2,27 @@ version: 2
 
 sources:
   - name: raw
-    description: Tables loaded by the ingestion step, unchanged from the source systems.
+    description: >
+      Tables loaded by the ingest process from landing files. Every value is text,
+      exactly as it arrived. Each row also carries _source_file, _row_number,
+      _loaded_at and _run_id.
     schema: raw
+    config:
+      # How recently each table must have received data.
+      loaded_at_field: _loaded_at
+      freshness:
+        warn_after: {count: 2, period: day}
+        error_after: {count: 7, period: day}
     tables:
       - name: orders
-        description: One row per order as exported by the shop system.
+        description: One row per order line of every order file loaded (append).
       - name: customers
-        description: One row per customer as exported by the CRM.
+        description: The latest customer list file (replaced in full).
+        config:
+          freshness:
+            warn_after: {count: 35, period: day}
+            error_after: {count: 70, period: day}
+      - name: products
+        description: The latest product list file (replaced in full).
+        config:
+          freshness: null

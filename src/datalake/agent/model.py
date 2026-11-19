@@ -21,5 +21,5 @@ class ChatMessage:
 class AgentEvent:
     """One step of an agent's answer, streamed to the UI."""
 
-    kind: Literal["status", "token", "citation", "final"]
+    kind: Literal["status", "sql", "token", "citation", "final"]
     text: str
