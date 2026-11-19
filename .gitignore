@@ -221,3 +221,11 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Spike stack data
+deploy/compose/spike/docker-volume/
+
+# dbt local state
+dbt/.user.yml
+dbt/logs/
+dbt/target/

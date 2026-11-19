@@ -2,9 +2,13 @@
 
 | | |
 |---|---|
-| **Status** | Accepted (v2): all decisions D1–D6 resolved (see §8 decision log) |
+| **Status** | Accepted (v4: Azure, ADLS Gen2 + two VMs) — all decisions resolved; claims checked against docs, two need a phase 1 test (§10) |
 | **Date** | 2026-11-18 |
-| **Scope** | Technology selection, system architecture, SDK code architecture, security baseline, delivery roadmap |
+| **Supersedes** | v2 (commit `53c247a`) |
+
+**What changed in v3.** The stack is cut to the essentials: lakehouse, dbt, metadata, agent and MCP. NVIDIA Auto Ontology, the RDF/OWL tooling, Dagster, DuckDB, the separate authorization services and the service-mesh/secrets stack are removed. §9 lists everything removed and why. The review problems found in v2 are addressed in §8.
+
+**What changed in v4.** The deployment target is fixed: **Azure only, with ADLS Gen2 for storage and two Azure VMs for compute and applications** (§3.3). Kubernetes, Helm, the S3 adapter and the self-hosted identity provider are removed. Microsoft Entra ID handles sign-in, and VM managed identities replace all storage credentials.
 
 ---
 
@@ -12,490 +16,558 @@
 
 The SDK helps developers and data engineers to:
 
-1. **Source and ingest** data from APIs, databases, files and SaaS tools into a lakehouse.
-2. **Process and transform** it with the **dbt** stack.
-3. **Govern** it with modern metadata management: catalog, lineage, glossary, **ontology**, data contracts and classification.
-4. **Explore** it with a *Data Explorer* that makes every dataset, column, term and document navigable, searchable and linked through metadata.
-5. **Converse** with it through an **agent UI (Chainlit)** and an **MCP server**.
-6. **Retrieve** with **BM25 + vector indexing, rank fusion and a cross-encoder reranking RAG pipeline**.
-
-Non-negotiable constraints:
+1. **Ingest** data into a lakehouse on distributed object storage.
+2. **Transform** it with **dbt**.
+3. **Describe** it with metadata: catalog, lineage, glossary and a lightweight ontology (business terms and their relationships).
+4. **Explore** it: every dataset, column and term is searchable and linked.
+5. **Converse** with it through an **agent (Chainlit UI)** and an **MCP server**, backed by BM25 + vector retrieval, rank fusion and cross-encoder reranking.
 
 | Constraint | What it means for the design |
 |---|---|
-| Cloud-provider agnostic | Only open standards at every boundary: S3 API and ABFS (Azure Data Lake Storage Gen2) for storage, Iceberg REST, OIDC, OpenTelemetry, OCI images, Kubernetes. No managed service is required. Each cloud's managed equivalent can be plugged in as an adapter. |
-| Distributed storage | Object storage plus an open table format (Iceberg). Compute and storage are separated. |
-| Containers | Every runtime component ships as a signed OCI image. Docker Compose for local work, Helm on Kubernetes for everything else. |
-| Modern security | Zero-trust defaults: OIDC/OAuth 2.1, fine-grained authorization, mTLS, secrets kept out of code, a signed supply chain. See §6. |
-| Python-first | Python ≥ 3.12 for all SDK code. Non-Python components (Trino, OpenSearch, Polaris) are consumed only as services over standard protocols. |
-| OO + constructor-only DI | Ports-and-adapters (hexagonal) architecture. Every collaborator is passed to `__init__`. No globals, no service locator, no DI-framework magic. See §5.3. |
+| Azure deployment | The supported target is Azure: ADLS Gen2 plus two VMs. The earlier cloud-agnostic goal is relaxed, but not lost: every component is open source and sits behind an SDK port using open protocols (ABFS, Iceberg REST, OIDC), so another cloud means new adapters, not a redesign. |
+| Distributed storage | ADLS Gen2 plus Apache Iceberg. Compute is separate from storage, so the VMs hold no lake data. |
+| Containers | Every service is an OCI image, run with Docker Compose on each VM. No Kubernetes. |
+| Modern security | OIDC sign-in, one access policy enforced at query and retrieval time, no long-lived storage keys, signed images. Built in from phase 1 (§6). |
+| Python-first | Python ≥ 3.12 for all SDK code. Trino, OpenSearch, Polaris and OpenMetadata are consumed as services. |
+| OO + constructor-only DI | Ports and adapters. Every collaborator arrives through `__init__` (§5). |
 
 ---
 
-## 2. Recommended stack at a glance
+## 2. The stack
 
-Every component below is open source under a permissive or OSI license, widely deployed in production, and replaceable behind an SDK port.
+### 2.1 Core (required)
 
-| Layer | Primary choice | Swappable alternatives (via adapter) | Why |
-|---|---|---|---|
-| **Object storage** | **First-class, equally supported:** any **S3-compatible** store (AWS S3, SeaweedFS, Ceph RGW) **and Azure Data Lake Storage Gen2** (`abfss://`, hierarchical namespace) | GCS, Garage | One `ObjectStore` port with S3 and ADLS Gen2 adapters (`obstore`, with `adlfs` for fsspec consumers). Every engine in the stack reads and writes both (§4.1.1). MinIO's community edition is no longer actively distributed, so the design does not depend on it (verify before deciding). |
-| **Table format** | **Apache Iceberg** (v2/v3 spec) | Delta Lake (read), DuckLake for laptop or dev use | The format-war winner, and every engine reads it. Supports schema evolution, time travel, and row-level deletes. |
-| **Table catalog** | **Apache Polaris** (Iceberg REST; ASF top-level project since Feb 2026) | Lakekeeper (Rust, lightweight), Nessie, AWS Glue / Unity via REST | Vendor-neutral REST catalog with RBAC and credential vending. Polaris is also gaining a Semantic Model API for Ossie documents. |
-| **Compute: SQL** | **Trino** (distributed) + **DuckDB** (embedded or single-node) | Spark (large batch), StarRocks | Trino covers cluster-scale federated SQL, and DuckDB covers fast local or CI work. dbt has adapters for both. |
-| **Ingestion** | **dlt (dltHub)**: a pure-Python library with schema inference and evolution | Airbyte (connector breadth), Debezium + Kafka (CDC) | Library-first, so it embeds in the SDK and is unit-testable. It writes directly to Iceberg or filesystem destinations. |
-| **Transformation** | **dbt**, through a `TransformEngine` port (see §4.2) | — | Required by the brief. Tests, docs, contracts, semantic layer (MetricFlow). |
-| **Orchestration** | **Dagster** (`dagster-dbt`, `dagster-dlt`) | Prefect, Airflow 3 | Its asset-centric model maps 1:1 onto dbt models and catalog entities, and it emits lineage metadata. |
-| **Metadata catalog** | **OpenMetadata** | DataHub | Native dbt ingestion (models, tests, lineage), glossary, classification, data contracts, a built-in MCP server, and Open Semantic Interchange (OSI) participation. One unified metadata model. |
-| **Lineage events** | **OpenLineage** | — | The open standard, emitted by Dagster, dbt, Trino and Spark. |
-| **Ontology** | **NVIDIA Auto Ontology** (Apache-2.0) as a sidecar service + SDK ontology model (**RDF/OWL via `rdflib`**, **SHACL via `pyshacl`**) + **Apache Ossie** YAML interchange | Hand-authored OWL, dbt semantic layer only | See §4.4. |
-| **Lexical index (BM25)** | **OpenSearch** (Apache-2.0, distributed) | `bm25s` or Tantivy for embedded or dev use | A real inverted index with analyzers, filtering and access control. |
-| **Vector index** | **OpenSearch k-NN** (HNSW, same cluster) | **Qdrant**, **pgvector**, **LanceDB** (embedded or dev) | One cluster can serve both indexes, which keeps the system simple. The SDK does the fusion itself, so the backends can be mixed. |
-| **Embeddings + reranker serving** | **Hugging Face Text Embeddings Inference (TEI)** containers | vLLM, Infinity, NVIDIA NIM | Production-grade, OpenAI-style API. Serves both bi-encoder and cross-encoder models. |
-| **Models (default)** | Embeddings: `BAAI/bge-m3` · Cross-encoder: `BAAI/bge-reranker-v2-m3` | Nemotron embed/rerank (NIM), Jina, Cohere | Open weights, multilingual, strong on retrieval benchmarks, and self-hostable. |
-| **Document parsing** | **Docling** (LF AI & Data) | Unstructured | Structure-aware parsing of PDF, DOCX, PPTX and HTML, with tables, which gives better chunks. |
-| **LLM access** | `ChatModel` port. **Default: Anthropic Claude via hosted API** (`claude-sonnet-5-5` for the agent, `claude-haiku-5-5` for cheap steps such as query rewriting; configurable). Second adapter: any OpenAI-compatible endpoint (vLLM, Ollama, NIM) | Other hosted providers | Provider-agnostic. Self-hosting is supported from phase 1 but is not a phase-1 gate; a fully air-gapped mode is hardened in phase 5. |
-| **Agent framework** | **LangGraph** (+ `langchain-mcp-adapters`) | Pydantic AI | Explicit, inspectable state-machine workflows (plan → retrieve → SQL → verify → answer) with checkpointing (Postgres saver), human-in-the-loop interrupts and streaming. Large ecosystem. It is confined to an adapter so the rest of the SDK stays framework-free (§4.7). |
-| **Agent UI** | **Chainlit** (≥ 2.12, pinned) | Open WebUI | Required by the brief. Kept a thin presentation layer (see risks in §9). |
-| **MCP server** | Official **MCP Python SDK** (`FastMCP`), Streamable HTTP transport | — | The reference implementation. Supports the MCP OAuth 2.1 authorization spec. |
-| **App / API services** | **FastAPI** + **Pydantic v2** + **Uvicorn** | — | Standard choice. Generates OpenAPI. |
-| **App state DB** | **PostgreSQL 17** (+ pgvector) | — | Also required by Auto Ontology and OpenMetadata, so one operational skill covers all three. |
-| **Identity** | **Keycloak** (OIDC / OAuth 2.1) | Any OIDC IdP (Entra ID, Okta, Auth0, Google) | Standard protocols only, so it is IdP-agnostic. |
-| **Authorization** | **OpenFGA** (ReBAC; CNCF) + **OPA** policies for Trino row/column security | Cedar | Fine-grained, relationship-based access control across datasets, documents and chunks. |
-| **Secrets** | **OpenBao** (open Vault fork, MPL-2.0) + External Secrets Operator | Cloud KMS / Secret Manager | Avoids the BSL license of HashiCorp Vault. |
-| **Service identity / mTLS** | **SPIFFE/SPIRE** or **Istio ambient / Linkerd** | — | Workload identity with no shared secrets. |
-| **Observability** | **OpenTelemetry** → Prometheus, Grafana, Tempo, Loki | Any OTLP backend | Vendor-neutral. Traces cover RAG steps and agent tool calls. |
-| **Packaging and runtime** | OCI images (distroless or Chainguard bases), **Helm**, **Docker Compose**, **Argo CD** (GitOps) | Kustomize | Runs on any Kubernetes: EKS, GKE, AKS, OpenShift, k3s. |
-| **Python toolchain** | **uv**, **ruff**, **pyright (strict)**, **pytest**, **hypothesis**, **testcontainers**, **import-linter** | — | Fast, reproducible. Architecture rules are enforced in CI. |
+| Layer | Choice | Why it is essential |
+|---|---|---|
+| **Object storage** | **Azure Data Lake Storage Gen2** (`abfss://`, hierarchical namespace on) | Distributed storage, the only Azure data service the design depends on (§4.1). |
+| **Table format** | **Apache Iceberg** | Open format every engine reads. Schema evolution and time travel. |
+| **Table catalog** | **Apache Polaris** (Iceberg REST) | One catalog shared by Trino, dlt and the SDK. A single small container. |
+| **SQL engine** | **Trino**, single node, in every profile | The one engine dbt runs on, in CI and in production, so tests mean the same thing everywhere. It has a whole VM to itself. |
+| **Ingestion** | **dlt** (Python library, no service) | Schema inference and evolution, incremental loads. Runs inside the SDK process. |
+| **Transformation** | **dbt-core 1.x** + `dbt-trino`, behind a `TransformEngine` port | Required by the brief. `dbt-oss` v2 can replace it later through configuration. |
+| **Metadata** | **OpenMetadata** | Catalog, lineage, glossary and a browsing UI in one service. Ingests dbt artifacts natively. Its ingestion runs as a Python step in the SDK pipeline, so no Airflow is needed. |
+| **Search index** | **OpenSearch** (BM25 + k-NN) | One cluster for both indexes. OpenMetadata uses the same cluster for its own search. |
+| **Model serving** | **Hugging Face TEI**: one container for embeddings (`BAAI/bge-m3`), one for the cross-encoder (`BAAI/bge-reranker-v2-m3`) | Needed for vector search and reranking. Runs on CPU, since the VMs have no GPU. The corpus is metadata, so it is small; rerank latency must be measured in phase 3 (R7). |
+| **LLM** | `ChatModel` port. Default **Claude via hosted API** (`claude-sonnet-5-5`; `claude-haiku-5-5` for cheap steps). Adapter for any OpenAI-compatible endpoint (vLLM, Ollama) | Provider-agnostic. |
+| **Agent** | **LangGraph**, behind an `AgentRuntime` port | Explicit workflow, checkpointing, human approval steps. |
+| **Agent UI** | **Chainlit** (pinned ≥ 2.12) | Required by the brief. Thin layer only. |
+| **MCP server** | Official **MCP Python SDK** (`FastMCP`), Streamable HTTP | The programmatic API of the SDK. There is no separate REST API. |
+| **State DB** | **PostgreSQL** | Shared by Polaris, OpenMetadata and LangGraph checkpoints. |
+| **Identity** | **Microsoft Entra ID** (OIDC), with app roles carried in the token | Sign-in for Chainlit, MCP and OpenMetadata. Nothing to host. |
+| **Reverse proxy** | **Caddy** | TLS termination and a single HTTPS entry point on the app VM. |
+
+That is **seven containers** to run besides the SDK's own app and the proxy: Polaris, Trino, Postgres, OpenMetadata, OpenSearch and two TEI containers. Outside the two VMs, the design uses only ADLS Gen2, Entra ID and Azure Key Vault.
+
+### 2.2 Optional add-ons (not in the core roadmap)
+
+| Add-on | When to add it |
+|---|---|
+| **Docling** document ingestion | When PDFs or Office documents must be searchable alongside metadata. The retrieval pipeline already accepts any chunk source. |
+| **Orchestrator** (Dagster, Airflow, Prefect) | When scheduling needs outgrow a systemd timer. The SDK pipeline is a plain CLI command any scheduler can call. |
+| **OpenLineage** events | When lineage is needed from tools other than dbt. |
+| **OPA** or **OpenFGA** | When access rules outgrow the role-based policy file (§6). |
+| **Presidio** PII detection | When classification tags cannot be maintained by hand in dbt. |
+| **Self-hosted LLM** (vLLM) | For air-gapped installs. Needs a GPU VM. |
+| **More Trino workers** | When one VM is no longer enough for dbt runs. Trino scales out by adding worker VMs with no change to the SDK. |
+| **Other clouds / S3** | Implement `ObjectStore` for S3 and swap the identity adapter. |
 
 ---
 
-## 3. System architecture
+## 3. Architecture
 
 ```mermaid
 flowchart LR
-  subgraph Sources
-    S1[(Databases)]:::src
-    S2[SaaS / REST APIs]:::src
-    S3[Files / Docs]:::src
-  end
+  SRC[Sources<br/>databases · APIs · files] --> DLT[dlt]
+  DLT --> ICE
 
-  subgraph Ingest["Ingest & Orchestrate"]
-    DLT[dlt pipelines]
-    DAG[Dagster]
-    DOC[Docling parser]
-  end
-
-  subgraph Lake["Lakehouse (distributed)"]
-    OBJ[(Object store<br/>S3-compatible or ADLS Gen2)]
+  subgraph Lake[Lakehouse]
     ICE[Iceberg tables<br/>raw → staging → marts]
-    POL[Apache Polaris<br/>Iceberg REST catalog]
+    OBJ[(ADLS Gen2)]
+    POL[Polaris catalog]
+    ICE --- OBJ
+    ICE --- POL
   end
 
-  subgraph Transform
-    DBT[dbt project<br/>models · tests · contracts · MetricFlow]
-    TRI[Trino]
-    DUCK[DuckDB]
+  DBT[dbt-core + dbt-trino] --> TRI[Trino] --> ICE
+  GIT[Git: dbt project<br/>models · docs · glossary.yml · access.yml] --> DBT
+
+  DBT -- artifacts --> OM[OpenMetadata<br/>catalog · lineage · glossary · UI]
+  GIT -- glossary sync --> OM
+
+  OM --> IDX[Indexer] --> OS[(OpenSearch<br/>BM25 + k-NN)]
+  IDX --> TEI[TEI embed / rerank]
+
+  subgraph App[SDK app]
+    EXP[ExplorerService]
+    RET[HybridRetriever]
+    QRY[QueryService]
+    AG[LangGraph agent]
   end
 
-  subgraph Meta["Metadata & Semantics"]
-    OM[OpenMetadata<br/>catalog · glossary · lineage]
-    OL[OpenLineage events]
-    AO[NVIDIA Auto Ontology<br/>generate · certify]
-    ONT[SDK Ontology Model<br/>RDF/OWL + SHACL · Ossie YAML]
-  end
-
-  subgraph Retrieval
-    IDX[Indexer]
-    OS[(OpenSearch<br/>BM25 + k-NN)]
-    TEI[TEI: embedder + cross-encoder]
-    RAG[Hybrid retriever → RRF → rerank → LLM]
-  end
-
-  subgraph Experience
-    EXP[Data Explorer API]
-    AG[Agent - LangGraph]
-    CL[Chainlit UI]
-    MCP[MCP Server]
-  end
-
-  S1 & S2 --> DLT --> ICE
-  S3 --> DOC --> IDX
-  DAG -. schedules .-> DLT & DBT & IDX
-  ICE --- OBJ
-  ICE --- POL
-  DBT --> TRI & DUCK --> ICE
-  DBT -- manifest/catalog --> OM
-  DAG & DBT & TRI --> OL --> OM
-  POL --> OM
-  OM --> AO --> ONT
-  ONT --> OM
-  OM & ONT --> IDX --> OS
-  IDX --> TEI
-  RAG --> OS & TEI
-  EXP --> OM & ONT & RAG & TRI
-  AG --> EXP
-  CL --> AG
-  MCP --> EXP
+  RET --> OS & TEI
+  EXP --> OM & RET
+  QRY --> TRI
+  AG --> EXP & QRY
+  CL[Chainlit UI] --> AG
+  MCP[MCP server] --> EXP & QRY
 ```
 
-### 3.1 Data flow
+### 3.1 The pipeline
 
-1. **Ingest.** dlt pipelines land source data as Iceberg tables in a `raw` namespace, registered in Polaris. Schema contracts are set to `evolve` or `freeze` per source.
-2. **Transform.** dbt builds `staging → intermediate → marts` on Trino (DuckDB in dev or CI), with model contracts, tests and MetricFlow semantic models.
-3. **Catalog.** After each run, OpenMetadata ingests the dbt `manifest.json`/`catalog.json`/`run_results.json`, the Polaris catalog and OpenLineage events. That gives one graph of datasets, columns, owners, tests, glossary terms and lineage.
-4. **Ontology.** Auto Ontology reads metadata and query history, proposes entities, relationships, FK links and business terms, and data stewards **certify** them. The SDK exports the certified ontology as Ossie YAML and RDF/OWL, validates it with SHACL, and writes term-to-column bindings back to the OpenMetadata glossary.
-5. **Index.** The Indexer turns catalog entities (tables, columns, dbt docs, glossary terms, ontology classes) and unstructured documents into chunks. It writes them to both the BM25 and vector indexes, each chunk carrying entity IDs, lineage links and ACL tags.
-6. **Explore and converse.** The Data Explorer API, Chainlit agent and MCP server all call the same application services. They never talk to back-ends directly.
+One command, `datalake run`, performs four steps in order. Each is also callable on its own.
 
-### 3.2 Deployment profiles
+1. **Ingest.** dlt loads source data into Iceberg tables in the `raw` namespace, registered in Polaris.
+2. **Transform.** dbt builds `staging → marts` on Trino, with model contracts and tests.
+3. **Sync metadata.** dbt artifacts (`manifest.json`, `catalog.json`, `run_results.json`) and `glossary.yml` are pushed to OpenMetadata.
+4. **Index.** Changed entities are re-embedded and written to OpenSearch. Removed entities are deleted from the index.
 
-| Profile | Footprint | Storage | Compute | Index | Use |
-|---|---|---|---|---|---|
-| `local` | `pip install ai-datalake-sdk[local]` — no containers | Local FS + DuckLake / SQLite catalog | DuckDB | `bm25s` + LanceDB (embedded) | Unit tests, notebooks, demos |
-| `compose` | Docker Compose | SeaweedFS + Polaris | DuckDB + Trino | OpenSearch single node | Integration tests, developer laptops |
-| `k8s` | Helm umbrella chart | Any S3, ADLS Gen2, GCS or Ceph | Trino cluster, Dagster | OpenSearch cluster | Staging and production on any cloud or on-prem |
+### 3.2 Profiles
 
-The **same SDK code** runs in all three. Only the composition root (§5.3) wires different adapters.
+| Profile | What runs | Use |
+|---|---|---|
+| `unit` | Nothing. In-memory fakes for every port (`datalake_sdk.testing`) | Unit tests, fast feedback |
+| `dev` | All containers in one Docker Compose file on a developer machine, with Azurite standing in for ADLS Gen2 | Development, integration tests, dbt runs |
+| `azure` | Two Compose files, one per VM, against a real ADLS Gen2 account | Staging and production |
+
+There is no embedded "laptop" engine. dbt always runs on Trino and tables are always Iceberg, so development and production behave the same.
+
+### 3.3 Deployment on Azure: two VMs
+
+```mermaid
+flowchart TB
+  U[Users / MCP clients] -- HTTPS 443 --> CADDY
+
+  subgraph VNET[Azure VNet]
+    subgraph VM2[VM 2 — applications]
+      CADDY[Caddy] --> APP[SDK app<br/>Chainlit + MCP]
+      CADDY --> OM[OpenMetadata]
+      APP --> OS[(OpenSearch)]
+      APP --> TEI[TEI embed + rerank]
+      OM --> OS
+      OM --> PG[(Postgres)]
+      APP --> PG
+    end
+    subgraph VM1[VM 1 — compute]
+      TRI[Trino]
+      POL[Polaris]
+      JOB[Pipeline runner<br/>dlt + dbt, systemd timer]
+      JOB --> TRI
+      TRI --> POL
+    end
+    APP -- SQL --> TRI
+    POL --> PG
+    JOB --> OM
+  end
+
+  TRI & POL & JOB -- managed identity --> ADLS[(ADLS Gen2<br/>lake + backups)]
+  PG & OS -. nightly backup .-> ADLS
+  APP -. sign-in .-> ENTRA[Entra ID]
+  VM1 & VM2 -. secrets .-> KV[Key Vault]
+```
+
+| | VM 1 — compute | VM 2 — applications |
+|---|---|---|
+| **Runs** | Trino (coordinator and worker in one), Polaris, the pipeline runner (`datalake run` on a systemd timer) | Caddy, SDK app (Chainlit + MCP), OpenMetadata, OpenSearch, Postgres, two TEI containers |
+| **Shape** | Memory-optimised, for Trino | General purpose |
+| **Starting size** | `Standard_E8s_v5` (8 vCPU, 64 GB) | `Standard_D8s_v5` (8 vCPU, 32 GB) |
+| **Disk** | OS disk only; Trino spill on the temp disk | Premium SSD data disk for Postgres and OpenSearch |
+| **Inbound** | Nothing from outside the VNet | HTTPS 443 only, limited to allowed IP ranges |
+| **Managed identity** | Read/write on the lake container | Write on the backups container only |
+
+The sizes are starting points and have not been load-tested. Both can be resized in place.
+
+**How it is operated**
+- **Provisioning:** one Bicep template creates the VNet, both VMs, the storage account, Key Vault and role assignments. `cloud-init` installs Docker and starts the Compose stack.
+- **Releases:** images are pinned by digest in the Compose files. A release is `docker compose pull && docker compose up -d` on each VM, run from CI over Entra-authenticated SSH.
+- **Scheduling:** a systemd timer on VM 1 runs `datalake run`. There is no orchestrator.
+- **Backups:** nightly `pg_dump` and OpenSearch snapshots go to a separate ADLS container. The lake itself is already durable in ADLS (zone- or geo-redundant storage).
+- **Recovery:** neither VM holds data that cannot be rebuilt. Recovery is: redeploy the Bicep template, restore Postgres and OpenSearch from backup, or simply re-run metadata sync and indexing.
+
+**What two VMs cannot give you**
+- **No high availability.** If either VM is down, part of the system is down. An Azure single-VM SLA applies to each.
+- **Compute scales up, not out.** Trino on one node is bounded by that VM's memory. Adding worker VMs later is supported by Trino but is outside this design.
 
 ---
 
-## 4. Key design decisions
+## 4. Design decisions
 
-### 4.1 Lakehouse: Iceberg + Polaris on S3-compatible storage or ADLS Gen2
-- Iceberg is the only table format with first-class read/write support in Trino, Spark, DuckDB, Flink, Snowflake, BigQuery and Databricks. That support is what makes the lake cloud-agnostic.
-- The **Iceberg REST catalog** protocol isolates the SDK from catalog vendors. Polaris is the default, and Lakekeeper or a cloud's managed REST catalog can be dropped in through configuration.
-- Polaris **credential vending** hands out short-lived, table-scoped storage credentials, so engines never hold long-lived bucket keys.
-- The SDK talks to Iceberg through **PyIceberg** for metadata, maintenance (snapshot expiry, compaction triggers) and small writes.
+### 4.1 Storage: ADLS Gen2
 
-#### 4.1.1 Azure Data Lake Storage Gen2 compatibility
+Storage is addressed as `abfss://<container>@<account>.dfs.core.windows.net/<path>` and reached through the `ObjectStore` port, which has one adapter (`AdlsGen2ObjectStore`, built on `obstore`).
 
-ADLS Gen2 is a first-class storage target, not an afterthought. It does **not** expose the S3 API, so the SDK never assumes S3. Storage is addressed by URI scheme (`s3://` or `abfss://<container>@<account>.dfs.core.windows.net/<path>`) and resolved by the `ObjectStore` port. Use storage accounts with the **hierarchical namespace enabled**: directory renames and deletes are then atomic and cheap, which helps dbt/Trino table rewrites and Iceberg maintenance.
+| Component | How it reaches ADLS Gen2 |
+|---|---|
+| SDK `ObjectStore` | `obstore` Azure back end |
+| PyIceberg | fsspec FileIO (`adlfs`) |
+| Polaris | Azure storage configuration on the catalog |
+| Trino | Native Azure file system, `azure.auth-type=DEFAULT` with `azure.user-assigned-managed-identity.client-id` |
+| dlt | `abfss://` filesystem destination with the Iceberg table format, catalog type `rest` (`az://` does not work with Iceberg) |
 
-| Component | ADLS Gen2 support | Notes |
-|---|---|---|
-| SDK `ObjectStore` port | `AdlsGen2ObjectStore` adapter (`obstore` Azure backend; `adlfs` for fsspec consumers) | Same contract-test suite as the S3 adapter |
-| Iceberg / PyIceberg | `abfss://` via the fsspec FileIO (`adlfs`) | Table and metadata locations are plain `abfss://` URIs |
-| Apache Polaris | Azure storage configuration per catalog, with **credential vending as short-lived, path-scoped SAS tokens** | Engines never hold account keys |
-| Trino | Native Azure file system (`fs.native-azure.enabled=true`) for the Iceberg connector | Auth through workload identity or vended credentials |
-| DuckDB / dbt-duckdb | `azure` extension (`abfss://`, Entra credential chain) | `local`/CI profile can point at Azurite or a real account |
-| dbt | Unchanged. dbt targets Trino or DuckDB, which handle ABFS | Model `location` config uses `abfss://` |
-| dlt | Filesystem destination with `az://`/`abfss://` URLs, writing Iceberg or Parquet | |
-| Spark (optional) | `hadoop-azure` ABFS driver | |
-| OpenMetadata | ADLS storage connector for container and file metadata | Lineage from OpenLineage is storage-agnostic |
-| Docling / Indexer | Reads source documents through the `ObjectStore` port | |
+- **One storage account, three containers:** `lake` (Iceberg tables: `raw`, `staging`, `marts`), `landing` (files awaiting ingestion) and `backups`.
+- **Hierarchical namespace enabled**, so directory renames and deletes are atomic.
+- **Authentication is by a user-assigned managed identity** attached to VM 1, with `Storage Blob Data Contributor` on the `lake` container. It must be user-assigned: that is the only kind Trino documents. Shared-key access is disabled on the account, so no key or connection string exists to leak.
+- **Polaris and dlt are the two unproven cases** (§10, V1b and V2b). Both are expected to pick the identity up through Azure's default credential chain, but their docs only describe a service principal. If the phase 1 test fails, those two use a service principal whose secret is in Key Vault, and Trino stays on the managed identity.
+- Polaris credential vending is not used: every process that touches storage runs on VM 1.
+- **Network:** the storage account accepts traffic only from the VNet, through a private endpoint.
+- **Testing:** contract tests run against Azurite. Because Azurite only partly emulates the hierarchical namespace, a nightly job runs the integration suite against a real account.
 
-**Authentication and security on Azure**
-- **Microsoft Entra Workload ID** (federated credentials for Kubernetes service accounts) or managed identity. **Shared-key access disabled** on the storage account, so there are no account keys or connection strings anywhere.
-- RBAC at the container level (`Storage Blob Data Contributor`/`Reader`) for the Polaris and ingest identities only. POSIX ACLs on the hierarchical namespace for coarse zone separation (`raw`/`staging`/`marts`). Fine-grained access stays in Polaris, OpenFGA and OPA.
-- **Private endpoints** with public network access disabled, encryption with **customer-managed keys** in Azure Key Vault, and soft delete plus versioning for recovery.
-- **Testing:** contract tests run against the **Azurite** emulator in testcontainers. Azurite's hierarchical-namespace (DFS) emulation is limited, so a nightly job also runs the integration suite against a real ADLS Gen2 account.
+### 4.2 dbt
 
-### 4.2 dbt: hide the version split behind a port
-The dbt landscape changed in 2026. **dbt 2.0** (Sept 2026) ships a Rust engine. Its open-source distribution is **`dbt-oss`** (Apache-2.0), with adapters in a Rust/ADBC monorepo, a built-in DuckDB adapter, and `catalogs.yml` support for Iceberg REST and DuckLake. The **Python dbt-core 1.x** line (for example 1.12) is still maintained and keeps the Python adapters (`dbt-trino`, `dbt-duckdb`) and the programmatic `dbtRunner`.
+- **dbt-core 1.x with `dbt-trino`** is the default (`DbtCoreRunner`, in-process `dbtRunner`).
+- The rest of the SDK reads only dbt **artifacts**, which are stable across versions. A `DbtOssCliRunner` for dbt v2 can be added later behind the same `TransformEngine` port.
+- The dbt project in Git is the source of truth for model documentation, column descriptions, tests, ownership (`meta.owner`), classification tags (`meta.classification`) and domains (`meta.domain`).
 
-**Decision:** define a `TransformEngine` port with two adapters:
+### 4.3 Metadata and the lightweight ontology
 
-| Adapter | Mechanism | When |
-|---|---|---|
-| `DbtCoreRunner` (default, phase 1) | In-process `dbtRunner` on dbt-core 1.x + `dbt-trino`/`dbt-duckdb` | Mature Python adapters and in-process invocation, easiest to test |
-| `DbtOssCliRunner` | Subprocess call to the `dbt-oss` v2 binary, parsing its JSON logs and artifacts | Once its Trino adapter and Iceberg catalog support are GA for our targets |
+**OpenMetadata is the system of record for metadata, and Git is the system of record for meaning.** The flow is one-way: Git → OpenMetadata → search index.
 
-Both adapters produce the same domain objects (`RunResult`, `Manifest`). The rest of the SDK only reads dbt **artifacts** (`manifest.json` and friends), which are stable across versions. Moving to v2 then takes one configuration change, with no rewrite.
+- **Catalog and lineage** come from dbt artifacts and the Polaris catalog.
+- **The ontology is a glossary with relationships**, kept in `glossary.yml` beside the dbt project:
 
-### 4.3 Metadata: OpenMetadata as the system of record
-- One metadata graph: datasets, columns, dbt models and tests, pipelines, glossary, classifications, owners, domains and data contracts.
-- Native dbt and OpenLineage ingestion means lineage comes from tooling and nobody hand-maintains it.
-- It has REST APIs and a Python SDK. The SDK wraps them in a `MetadataCatalog` port, so DataHub stays a valid alternative adapter.
-- The Data Explorer **adds** to OpenMetadata and does not duplicate it: it adds ontology-aware navigation, hybrid search over metadata plus documents, and the conversational layer. OpenMetadata's UI remains the data-steward workbench.
+```yaml
+terms:
+  - name: Customer
+    description: A person or organisation that has placed at least one order.
+    synonyms: [client, account holder]
+    related: [Order, Subscription]
+    parent: Party
+    bound_to:
+      - model: dim_customer
+      - column: fct_orders.customer_id
+```
 
-### 4.4 Ontology: Auto Ontology + an SDK-owned semantic model
-**What NVIDIA Auto Ontology provides** (Apache-2.0): ingestion of database metadata and query history, LLM-proposed FK links, descriptions and business terms, a **human certification workflow**, a text-to-SQL agent grounded in the ontology, a read-only **FastMCP server**, and **Apache Ossie YAML** import/export. It runs as services (Next.js UI, FastAPI backend, ingestion service, MCP server, Postgres + pgvector, optional Vault) and has **no documented Python library API**.
+- The SDK validates this file (names unique, references resolve, bound models exist in the dbt manifest) and syncs it to the OpenMetadata glossary, including term-to-column links.
+- This gives navigable business concepts, synonyms for query expansion and term-to-data links. It does not give formal reasoning (OWL, SHACL). An `OntologySource` port leaves room to add a generator or a richer model later without touching the rest of the SDK.
+- **The browsing UI is OpenMetadata's.** Chainlit answers link to the entity page there. No separate explorer UI is built.
 
-**Integration decision**
-- Deploy Auto Ontology as a **sidecar service** (its own Helm release) pointed at Trino or DuckDB.
-- Wrap its REST and MCP endpoints in an `OntologyGenerator` adapter (`AutoOntologyClient`). The SDK never imports its internals.
-- Own the **canonical ontology model** inside the SDK:
-  - **Interchange:** Apache **Ossie** YAML, the vendor-neutral semantic model spec (incubating; spec 0.1.x), which has converters for dbt MetricFlow and Polaris.
-  - **Reasoning and validation:** RDF/OWL graph through `rdflib`, constraint validation through `pyshacl`, and SPARQL for graph navigation in the Explorer. **Oxigraph** is an optional persistent store.
-  - **Bindings:** `OntologyClass ↔ Iceberg table`, `Property ↔ column`, `Relationship ↔ FK/join path`, `Term ↔ OpenMetadata glossary term`.
-- **Security notes:**
-  - By default Auto Ontology calls NVIDIA-hosted model endpoints. Point it at self-hosted NIM or any OpenAI-compatible endpoint (vLLM) for data residency.
-  - Its ingestion endpoints are **unauthenticated by design**, so keep them on a private network behind a mesh policy.
-  - Leave **KumoRFM disabled**, because it uploads table data to a hosted service.
-
-### 4.5 Retrieval: hybrid search with SDK-side fusion and cross-encoder reranking
+### 4.4 Retrieval
 
 ```mermaid
 flowchart LR
-  Q[Query] --> QP[Query processor<br/>normalize · expand with ontology synonyms · ACL filter]
-  QP --> L[LexicalRetriever<br/>BM25 top-k]
-  QP --> V[VectorRetriever<br/>dense top-k]
-  L & V --> F[RankFuser<br/>RRF k=60 / weighted]
-  F --> R[CrossEncoderReranker<br/>bge-reranker-v2-m3, top-n]
-  R --> C[ContextBuilder<br/>dedupe · cite · token budget]
-  C --> G[Generator - ChatModel]
-  G --> A[Answer + citations + linked entities]
+  Q[Query] --> QP[Expand with glossary synonyms<br/>+ access filter]
+  QP --> L[BM25 top 50]
+  QP --> V[Vector top 50]
+  L & V --> F[RRF fusion in the SDK]
+  F --> R[Cross-encoder rerank → top 8]
+  R --> C[Context with citations]
+  C --> G[LLM answer]
 ```
 
-- **Indexing.** Docling handles structure-aware chunking. Every chunk carries `entity_urn`, `lineage_urns`, `ontology_classes`, `classification` and `acl_principals`. Both indexes receive the same chunk IDs.
-- **Fusion happens in the SDK, not the engine.** Reciprocal Rank Fusion, $\text{score}(d)=\sum_i \frac{w_i}{k + \text{rank}_i(d)}$, is implemented as a pure function. That makes it deterministic, unit-testable and independent of the back-end: OpenSearch BM25 can be fused with Qdrant vectors.
-- **Reranking.** A cross-encoder scores (query, passage) pairs over the fused top 50 and keeps the top 8. It is served by TEI and has an in-process `sentence-transformers` adapter for local use.
-- **Security trimming** happens *before* retrieval, using filter clauses built from OpenFGA, and is re-checked at context build. That prevents leaks through search results.
-- **Evaluation.** A harness built on **Ragas** or a custom metric set (recall@k, nDCG, MRR, faithfulness) with golden datasets, run in CI on fixed fixtures.
+- **What is indexed:** one document per dbt model, per column group, and per glossary term, built from names, descriptions, tests, lineage neighbours and bound terms. Each carries its entity URN, `domain` and `classification`.
+- **Why a second index next to OpenMetadata's own:** OpenMetadata's search has no vectors, no reranking and no hook for the SDK's access filter. Both live in the same OpenSearch cluster.
+- **Fusion** is Reciprocal Rank Fusion, `score(d) = Σ 1 / (k + rank_i(d))` with `k = 60`, implemented as a pure function in the domain layer.
+- **The two searches run concurrently.** All I/O ports are `async`.
+- **Incremental indexing:** each document stores a content hash. Unchanged entities are skipped, and entities missing from the latest manifest are deleted.
+- **Evaluation:** recall@k, nDCG@10 and MRR on a golden question set, run in CI.
 
-### 4.6 Data Explorer
-The Data Explorer is a service plus a library, not a separate web app in phase 1.
-- **`ExplorerService`** offers search (hybrid), `get_entity(urn)`, `neighbors(urn, relation)` (lineage, ontology, glossary, FK), `sample(urn)` (policy-checked, through Trino), and `explain(urn)` (an LLM summary grounded in metadata).
-- It is exposed through the **FastAPI REST API**, **MCP tools** and **Chainlit** (with custom elements for entity cards and lineage graphs).
-- **Phase 3 option:** a dedicated React explorer UI on the same API, if Chainlit plus the OpenMetadata UI prove insufficient.
+### 4.5 Agent and MCP
 
-### 4.7 Agent UI and MCP server
-- **One application layer, three front-ends.** Chainlit, MCP and REST are thin adapters over the same `ExplorerService`, `RagPipeline` and `QueryService`.
-- **MCP tools (initial):** `search_catalog`, `get_entity`, `get_lineage`, `get_ontology_neighbors`, `ask_data` (RAG), `run_readonly_sql` (policy-gated), `describe_metric`. **Resources:** dataset schemas, glossary terms. **Prompts:** curated analysis templates.
-- **MCP auth.** The server is an OAuth 2.1 resource server per the MCP authorization spec: Keycloak issues tokens, audiences are validated, and the user's identity is propagated so OpenFGA and OPA enforce **the end user's** permissions, not a service account's.
-- **The agent** is a LangGraph `StateGraph`. Through `langchain-mcp-adapters` it consumes the SDK's own MCP server **and** Auto Ontology's MCP server as tools, so ontology-grounded text-to-SQL is available in the same conversation.
-
-**Keeping LangGraph compatible with constructor-only DI**
-- The application layer defines an `AgentRuntime` port (`ask(question, principal, thread_id) -> AsyncIterator[AgentEvent]`). Chainlit, MCP and REST depend on that port only, never on LangGraph types.
-- `adapters/agent/langgraph_runtime.py` implements it. Each graph node is a **class** whose collaborators (`ChatModel`, `ExplorerService`, `HybridRetriever`, `QueryService`, `AccessPolicy`) arrive through `__init__`. Its `__call__(state) -> dict` is what is registered with the graph.
-- A `GraphBuilder` takes the node instances and a `BaseCheckpointSaver` in its constructor and returns the compiled graph. It is invoked only from the composition root. No module-level `graph = ...` globals, and no tools that reach for clients through closures over globals.
-- The SDK's `ChatModel` port is bridged to LangChain's `BaseChatModel` by an adapter, so the model provider is still chosen in `bootstrap/`.
-- **Checkpointing:** `PostgresSaver` in `compose`/`k8s`, `InMemorySaver` in `local` and tests. Human-in-the-loop `interrupt()` gates any tool that writes or that exceeds a cost or row threshold.
-- **Testing:** unit-test each node class directly with SDK fakes. Test whole graphs with LangChain's `GenericFakeChatModel` (scripted responses and tool calls) and `InMemorySaver`. Assert on the state transitions and the tools called, with no network.
+- **One application layer, two front ends.** Chainlit and the MCP server are thin adapters over `ExplorerService`, `HybridRetriever` and `QueryService`.
+- **MCP tools:** `search_catalog`, `get_entity`, `get_lineage`, `get_glossary_term`, `ask_data`, `run_readonly_sql`. **Resources:** model schemas, glossary terms.
+- **The agent** is a LangGraph graph: understand question → retrieve metadata → draft SQL → validate (parse, read-only, row limit) → run → answer with citations. It calls application services directly, not through MCP.
+- **LangGraph and constructor injection:**
+  - The application layer defines an `AgentRuntime` port. Chainlit depends on that port, never on LangGraph types.
+  - Each graph node is a class whose collaborators arrive through `__init__`. A `GraphBuilder` assembles them, and is called only from the composition root.
+  - Checkpoints use `PostgresSaver`, or `InMemorySaver` in tests.
+  - Tests use LangChain's `GenericFakeChatModel`, so they need no network.
+- **SQL always runs as the end user's role** (§6). There is no second query path.
 
 ---
 
 ## 5. SDK code architecture
 
-### 5.1 Layering (hexagonal / ports and adapters)
+### 5.1 Layers
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│ interfaces   chainlit_app · mcp_server · rest_api · cli          │  thin, no business logic
-├──────────────────────────────────────────────────────────────────┤
-│ application  IngestionService · TransformService · ExplorerService│  use-cases; depend on ports only
-│              IndexingService · RagPipeline · OntologyService      │
-├──────────────────────────────────────────────────────────────────┤
-│ domain       Dataset · Column · Term · OntologyClass · Chunk      │  pure Python, no I/O, no 3rd-party
-│              SearchHit · LineageEdge · RankFusion (pure fns)      │
-├──────────────────────────────────────────────────────────────────┤
-│ ports        typing.Protocol interfaces (ObjectStore, TableCatalog│
-│              MetadataCatalog, TransformEngine, LexicalIndex, …)   │
-├──────────────────────────────────────────────────────────────────┤
-│ adapters     pyiceberg · polaris · openmetadata · dlt · dbt ·     │  only layer importing vendor libs
-│              opensearch · qdrant · lancedb · tei · anthropic · …  │
-└──────────────────────────────────────────────────────────────────┘
-                 bootstrap/  ← the composition root wires everything
+interfaces    chainlit_app · mcp_server · cli           thin, no business logic
+application   PipelineService · ExplorerService ·       use-cases; depend on ports only
+              IndexingService · HybridRetriever · QueryService
+domain        Dataset · Column · Term · Chunk ·         pure Python, no I/O
+              SearchHit · LineageEdge · rrf()
+ports         typing.Protocol interfaces                async for all I/O
+adapters      pyiceberg · dlt · dbt · trino ·           only layer importing vendor libraries
+              openmetadata · opensearch · tei · llm · langgraph
+bootstrap     settings.py · container.py                the single composition root
 ```
 
-Dependency rule: arrows point **inward** only. `import-linter` contracts in CI fail the build if `domain` imports anything outside the standard library, or if `application` imports an adapter.
+`import-linter` fails the build if `domain` imports anything outside the standard library, or if `application` imports an adapter.
 
 ### 5.2 Package layout
 
 ```
 ai-datalake-sdk/
-├── pyproject.toml                  # uv; extras: [ingest] [dbt] [rag] [agent] [mcp] [ui] [local] [all]
+├── pyproject.toml              # uv; extras: [ingest] [dbt] [rag] [agent] [ui] [all]
 ├── src/datalake_sdk/
-│   ├── domain/                     # entities, value objects, errors, pure algorithms (rrf.py)
-│   ├── ports/                      # Protocols: storage.py, catalog.py, metadata.py, transform.py,
-│   │                               #   ingest.py, ontology.py, retrieval.py, llm.py, authz.py, clock.py
-│   ├── application/                # services / use-cases
+│   ├── domain/
+│   ├── ports/                  # storage, catalog, ingest, transform, metadata,
+│   │                           #   retrieval, query, llm, agent, access, clock
+│   ├── application/
 │   ├── adapters/
-│   │   ├── storage/    (obstore_s3.py, obstore_adls_gen2.py, pyiceberg_catalog.py)
-│   │   ├── ingest/     (dlt_pipeline.py)
-│   │   ├── transform/  (dbt_core_runner.py, dbt_oss_cli_runner.py)
-│   │   ├── metadata/   (openmetadata.py, openlineage.py)
-│   │   ├── ontology/   (auto_ontology_client.py, rdflib_store.py, ossie_codec.py)
-│   │   ├── retrieval/  (opensearch_bm25.py, opensearch_knn.py, qdrant.py, lancedb.py, bm25s.py,
-│   │   │                tei_embedder.py, tei_reranker.py, st_cross_encoder.py)
-│   │   ├── llm/        (anthropic.py, openai_compatible.py, langchain_bridge.py)
-│   │   ├── agent/      (langgraph_runtime.py, nodes/, graph_builder.py)
-│   │   └── security/   (openfga.py, oidc.py)
-│   ├── interfaces/     (mcp_server.py, chainlit_app.py, rest_api.py, cli.py)
-│   ├── bootstrap/      (settings.py, container.py, profiles.py)   # composition root
-│   └── testing/        # in-memory fakes for EVERY port; shipped for SDK consumers
-├── tests/
-│   ├── unit/          # fakes only, ms-fast, no network
-│   ├── contract/      # same test suite run against fake AND real adapter (testcontainers)
-│   ├── integration/   # compose profile
-│   └── eval/          # retrieval/RAG quality on golden sets
-├── dbt/                # reference dbt project (staging/marts/semantic models)
-├── deploy/
-│   ├── compose/
-│   └── helm/
+│   │   ├── storage/   (adls_gen2.py, pyiceberg_catalog.py)
+│   │   ├── ingest/    (dlt_pipeline.py)
+│   │   ├── transform/ (dbt_core_runner.py)
+│   │   ├── query/     (trino.py)
+│   │   ├── metadata/  (openmetadata.py, glossary_yaml.py)
+│   │   ├── retrieval/ (opensearch_bm25.py, opensearch_knn.py, tei_embedder.py, tei_reranker.py)
+│   │   ├── llm/       (anthropic.py, openai_compatible.py)
+│   │   ├── agent/     (langgraph_runtime.py, nodes/, graph_builder.py)
+│   │   └── security/  (entra_oidc.py, policy_file.py, key_vault.py)
+│   ├── interfaces/    (cli.py, mcp_server.py, chainlit_app.py)
+│   ├── bootstrap/     (settings.py, container.py)
+│   └── testing/       # in-memory fake for every port, shipped to SDK users
+├── tests/  (unit/, contract/, integration/, eval/)
+├── dbt/                # reference project, glossary.yml, access.yml
+├── deploy/ (compose/dev/, compose/vm1-compute/, compose/vm2-apps/, bicep/)
 └── docs/
 ```
 
 ### 5.3 Constructor-only dependency injection
 
-Rules:
-1. Every class gets its collaborators **only** through `__init__`, typed against a **port** (`Protocol`), never against a concrete adapter.
-2. No module-level singletons, no `get_client()` globals, no service locator, no setter injection, no hidden `os.environ` reads outside `bootstrap/settings.py`.
-3. Even time, randomness and ID generation are injected (`Clock`, `IdGenerator`), which keeps tests deterministic.
-4. Objects are immutable after construction (`__slots__` or `@dataclass(frozen=True)` for values). Services hold only their dependencies.
-5. Exactly **one composition root** (`bootstrap/container.py`) builds the object graph from typed `Settings` (pydantic-settings). Each interface (CLI, MCP, Chainlit, REST) calls it once at start-up.
-6. No DI framework is required. Plain factory functions keep wiring explicit and type-checked. A framework such as `dependency-injector` could be added later, but only inside `bootstrap/`.
+1. Every class receives its collaborators **only** through `__init__`, typed against a port.
+2. No module-level singletons, no service locator, no setter injection. Environment variables are read only in `bootstrap/settings.py`.
+3. Time and ID generation are injected too (`Clock`, `IdGenerator`).
+4. One composition root builds the object graph. No DI framework.
 
 ```python
 # ports/retrieval.py
-from typing import Protocol, Sequence
-from datalake_sdk.domain.search import Query, SearchHit, ScoredPassage
-
 class LexicalIndex(Protocol):
-    def search(self, query: Query, top_k: int) -> Sequence[SearchHit]: ...
+    async def search(self, query: Query, top_k: int) -> Sequence[SearchHit]: ...
+
 
 class VectorIndex(Protocol):
-    def search(self, query: Query, top_k: int) -> Sequence[SearchHit]: ...
+    async def search(self, query: Query, top_k: int) -> Sequence[SearchHit]: ...
 
-class RankFuser(Protocol):
-    def fuse(self, *rankings: Sequence[SearchHit]) -> Sequence[SearchHit]: ...
 
 class Reranker(Protocol):
-    def rerank(self, query: Query, hits: Sequence[SearchHit], top_n: int) -> Sequence[ScoredPassage]: ...
+    async def rerank(
+        self, query: Query, hits: Sequence[SearchHit], top_n: int
+    ) -> Sequence[ScoredPassage]: ...
 ```
 
 ```python
 # application/retrieval.py
 class HybridRetriever:
-    """Depends only on ports; fully testable with fakes."""
-
     def __init__(
         self,
         lexical: LexicalIndex,
         vector: VectorIndex,
-        fuser: RankFuser,
         reranker: Reranker,
-        authz: AccessPolicy,
+        policy: AccessPolicy,
         candidate_k: int = 50,
         final_n: int = 8,
     ) -> None:
         self._lexical = lexical
         self._vector = vector
-        self._fuser = fuser
         self._reranker = reranker
-        self._authz = authz
+        self._policy = policy
         self._candidate_k = candidate_k
         self._final_n = final_n
 
-    def retrieve(self, query: Query, principal: Principal) -> Sequence[ScoredPassage]:
-        scoped = query.with_filter(self._authz.search_filter(principal))
-        fused = self._fuser.fuse(
+    async def retrieve(self, query: Query, principal: Principal) -> Sequence[ScoredPassage]:
+        scoped = query.with_filter(self._policy.search_filter(principal))
+        lexical, vector = await asyncio.gather(
             self._lexical.search(scoped, self._candidate_k),
             self._vector.search(scoped, self._candidate_k),
         )
-        allowed = [h for h in fused if self._authz.can_read(principal, h.entity_urn)]
-        return self._reranker.rerank(query, allowed, self._final_n)
+        return await self._reranker.rerank(query, rrf(lexical, vector, k=60), self._final_n)
 ```
 
 ```python
-# bootstrap/container.py  — the ONLY place that knows concrete classes
+# bootstrap/container.py — the only place that names concrete classes
 def build_retriever(s: Settings) -> HybridRetriever:
-    os_client = OpenSearchClientFactory(s.opensearch).create()
+    client = AsyncOpenSearch(**s.opensearch.client_kwargs())
     return HybridRetriever(
-        lexical=OpenSearchBm25Index(os_client, s.opensearch.index),
-        vector=OpenSearchKnnIndex(os_client, s.opensearch.index, TeiEmbedder(s.tei.embed_url)),
-        fuser=ReciprocalRankFuser(k=60),
-        reranker=TeiCrossEncoderReranker(s.tei.rerank_url),
-        authz=OpenFgaAccessPolicy(OpenFgaClient(s.openfga)),
+        lexical=OpenSearchBm25Index(client, s.opensearch.index),
+        vector=OpenSearchKnnIndex(client, s.opensearch.index, TeiEmbedder(s.tei.embed_url)),
+        reranker=TeiReranker(s.tei.rerank_url),
+        policy=FilePolicy.load(s.access_policy_path),
     )
 ```
 
 ```python
-# tests/unit/test_hybrid_retriever.py — no network, no mocks library needed
-def test_unauthorized_hits_never_reach_reranker() -> None:
-    reranker = RecordingReranker()
+# tests/unit/test_hybrid_retriever.py
+async def test_search_is_scoped_to_the_principals_domains() -> None:
+    lexical = InMemoryLexicalIndex([doc("urn:sales", domain="sales"), doc("urn:hr", domain="hr")])
     retriever = HybridRetriever(
-        lexical=InMemoryLexicalIndex([hit("urn:a"), hit("urn:secret")]),
-        vector=InMemoryVectorIndex([hit("urn:secret")]),
-        fuser=ReciprocalRankFuser(k=60),
-        reranker=reranker,
-        authz=StaticAccessPolicy(allowed={"urn:a"}),
+        lexical=lexical,
+        vector=InMemoryVectorIndex([]),
+        reranker=PassThroughReranker(),
+        policy=StaticPolicy(domains={"alice": {"sales"}}),
     )
-    retriever.retrieve(Query("revenue"), Principal("alice"))
-    assert reranker.seen_urns == ["urn:a"]
+    hits = await retriever.retrieve(Query("revenue"), Principal("alice"))
+    assert [h.entity_urn for h in hits] == ["urn:sales"]
 ```
 
-### 5.4 Testing strategy
+### 5.4 Testing
 
-| Level | What | Tools | Gate |
-|---|---|---|---|
-| Unit | Domain and application with `datalake_sdk.testing` fakes | pytest, hypothesis (for example, RRF properties) | ≥ 90% branch coverage on `domain` + `application` |
-| Contract | One abstract test suite per port, run against the fake **and** each real adapter | pytest parametrization + testcontainers (OpenSearch, Postgres, Trino, Polaris, SeaweedFS) | Fakes must behave like real adapters |
-| Integration | End-to-end on the `compose` profile: ingest → dbt → catalog → index → ask | Docker Compose, Dagster test harness | Nightly + on release |
-| dbt | Model contracts, data tests, unit tests (`dbt test`) | dbt, `dbt-checkpoint` | Every PR |
-| Retrieval eval | recall@k, nDCG@10, MRR, faithfulness on golden sets | Ragas or custom | No regression beyond threshold |
-| Agent | Node classes in isolation, plus whole-graph flows with `GenericFakeChatModel` + `InMemorySaver` (routing, tool calls, interrupts) | pytest, pytest-asyncio | Every PR |
-| Architecture | Layer import rules | import-linter, pyright strict | Every PR |
+| Level | What | Tools |
+|---|---|---|
+| Unit | Domain and application against fakes | pytest, pytest-asyncio, hypothesis |
+| Contract | One suite per port, run against the fake **and** the real adapter | testcontainers (OpenSearch, Postgres, Trino, Polaris, Azurite) |
+| Integration | `datalake run` end to end, then ask a question | `dev` profile; nightly against real ADLS Gen2 |
+| dbt | Contracts, data tests, unit tests, on Trino | `dbt build` |
+| Retrieval eval | recall@k, nDCG@10, MRR on a golden set | custom harness |
+| Agent | Node classes alone; whole graph with a scripted fake model | `GenericFakeChatModel`, `InMemorySaver` |
+| Architecture | Layer import rules, strict typing | import-linter, pyright |
 
 ---
 
-## 6. Security baseline (zero-trust by default)
+## 6. Security
+
+**One policy, two enforcement points.** Access rules live in one file in Git, `access.yml`, keyed on Entra ID app roles carried in the user's token:
+
+```yaml
+roles:
+  analyst_sales:
+    domains: [sales]
+    max_classification: internal      # public < internal < confidential < restricted
+    masks:
+      - column: dim_customer.email
+        expression: "'***'"
+```
+
+The SDK turns this file into:
+
+1. **Trino file-based access control rules** (schema and table grants, column masks, row filters), regenerated on each deploy.
+2. **An OpenSearch filter** on `domain` and `classification`, applied to every retrieval query.
+
+Because the index stores attributes of the data (`domain`, `classification`) and not lists of people, a change to who holds a role takes effect immediately with no re-indexing.
 
 | Area | Control |
 |---|---|
-| **Identity** | OIDC SSO (Keycloak or any IdP) for UI and API. **OAuth 2.1 + PKCE** for Chainlit and MCP clients. Short-lived JWTs with audience validation. No API keys for humans. |
-| **Authorization** | **OpenFGA** relationship model (`user → member → group → viewer → dataset → contains → chunk`). Polaris RBAC for catalog operations. **OPA** plugin in Trino for row filters and column masks. Enforced at query and retrieval time, with the end user's identity propagated through agent and MCP calls. |
-| **Service-to-service** | mTLS through SPIFFE/SPIRE or Istio ambient. Kubernetes NetworkPolicies default-deny. Private-only exposure for Auto Ontology ingestion and admin endpoints. |
-| **Secrets** | OpenBao + External Secrets Operator. Polaris credential vending for storage. Nothing in images, env files or Git (`gitleaks` pre-commit). |
-| **Data protection** | TLS 1.3 in transit. Encryption at rest: SSE-KMS on S3, customer-managed keys (Key Vault) on ADLS Gen2, or Ceph/SeaweedFS encryption. On Azure, Entra Workload ID with shared-key access disabled and private endpoints (§4.1.1). PII detection with **Microsoft Presidio** at ingest, which tags OpenMetadata classifications and drives masking and index exclusion. |
-| **LLM / agent safety** | Prompt-injection hygiene: retrieved text is treated as data, tool allow-lists apply, `run_readonly_sql` uses a read-only role with row limits and timeouts, and a human confirms any write tool. Data-residency switch to force self-hosted models. Full tool-call audit trail. Mapped to **OWASP Top 10 for LLM Applications**. |
-| **Supply chain** | Pinned dependencies (`uv.lock`), `pip-audit` / OSV scanning, **Trivy** image scanning, **Syft** SBOMs, **cosign** signatures with **SLSA** provenance (GitHub Actions OIDC), Kyverno policy that admits signed images only. Distroless, non-root, read-only-rootfs containers. |
-| **Audit and observability** | OpenTelemetry traces across ingest → dbt → retrieval → LLM. Immutable audit log of data access and agent actions. OpenLineage for data provenance. |
-| **Compliance posture** | Controls align with OWASP ASVS L2, CIS Kubernetes Benchmark and the NIST SSDF. |
+| **Sign-in** | Microsoft Entra ID: OIDC with PKCE for Chainlit and OpenMetadata. The MCP server is an OAuth 2.1 resource server and validates token audience. Roles are Entra app roles, assigned to users or groups. |
+| **Queries** | The SDK connects to Trino with a service credential and runs each query as the Trino user for the caller's role (`role_analyst_sales`), so Trino applies that role's grants and masks. Queries are read-only, row-limited and time-limited. The SDK's audit log records the real user, role and SQL. |
+| **Storage** | VM managed identities with the least role each needs (§3.3). Shared-key access disabled; private endpoint only; encryption at rest with Microsoft-managed or customer-managed keys. |
+| **LLM data gate** | Only metadata and query results at or below a configured classification (default `internal`) may be sent to a hosted model. Results containing higher-classified columns are summarised locally as row counts and column names only, or the request is refused. |
+| **Secrets** | Azure Key Vault, read at start-up through the VM's managed identity (LLM API key, Postgres and Trino service passwords, Entra client secret). Nothing in images, Compose files or Git (`gitleaks` in pre-commit). |
+| **Network** | One VNet. Network security groups allow HTTPS 443 into VM 2 from approved IP ranges, and only the needed ports from VM 2 to VM 1. No public IP on VM 1. Admin access is Entra-authenticated SSH through Azure Bastion. TLS at Caddy. |
+| **Hosts** | Encryption at host, automatic OS patching, Defender for Servers optional. Containers run as non-root. |
+| **Supply chain** | `uv.lock`, `pip-audit`, Trivy image scans, SBOMs, images pinned by digest. |
+| **Agent safety** | Retrieved text is treated as data, never as instructions. Tools are allow-listed. Any future write tool requires human approval through a LangGraph interrupt. |
+| **Audit** | OpenTelemetry traces across pipeline, retrieval and agent steps. Append-only audit log of data access. |
 
 ---
 
 ## 7. Roadmap
 
-| Phase | Duration (indicative) | Deliverables |
+Durations assume **two to three engineers** and are indicative.
+
+| Phase | Duration | Deliverables |
 |---|---|---|
-| **0. Foundations** | 2 wks | Repo scaffold (uv, ruff, pyright, import-linter, pre-commit, CI), domain model, all ports, `testing/` fakes, composition root, `local` profile |
-| **1. Lakehouse core** | 4 wks | Object-store adapters (S3 **and ADLS Gen2**, with Azurite contract tests) and Iceberg/Polaris adapters, dlt ingestion, `DbtCoreRunner` on DuckDB + Trino, Dagster assets, reference dbt project, `compose` profile |
-| **2. Metadata and ontology** | 4 wks | OpenMetadata + OpenLineage adapters, Auto Ontology sidecar + client, Ossie/RDF codecs + SHACL validation, glossary bindings |
-| **3. Retrieval** | 4 wks | Docling chunking, BM25 + vector adapters (OpenSearch, LanceDB, bm25s), RRF, TEI reranker, RAG pipeline, eval harness |
-| **4. Experience** | 4 wks | ExplorerService, MCP server (OAuth 2.1), LangGraph agent with Postgres checkpointing, Chainlit app, REST API |
-| **5. Hardening and production** | 3 wks | OpenFGA/OPA enforcement end to end, Helm charts, signed images, SBOMs, observability dashboards, load and security testing, `DbtOssCliRunner` evaluation, air-gapped profile (self-hosted LLM via vLLM, TEI, Auto Ontology on local NIM/vLLM) |
+| **0. Foundations** | 2 wks | Repo tooling (uv, ruff, pyright, import-linter, CI), domain model, ports, fakes, composition root, `access.yml` model and `AccessPolicy` port |
+| **1. Lakehouse and dbt** | 4 wks | ADLS Gen2 adapter, Polaris/PyIceberg adapter, dlt ingestion, `DbtCoreRunner` on Trino, generated Trino access rules, Entra ID sign-in, `dev` profile, reference dbt project, Bicep template and first two-VM deployment |
+| **2. Metadata** | 3 wks | OpenMetadata adapter (dbt artifacts, lineage), `glossary.yml` validation and sync, `ExplorerService` |
+| **3. Retrieval** | 3 wks | Indexer with incremental updates, BM25 + vector adapters, RRF, reranker, access filter, eval harness |
+| **4. Agent and MCP** | 4 wks | `QueryService`, LangGraph agent, MCP server with OAuth 2.1, Chainlit app, LLM data gate |
+| **5. Production** | 2 wks | Load test and VM sizing, dashboards, SBOMs, real-ADLS nightly suite, backup and restore drill |
 
 ---
 
-## 8. Risks and open decisions
+## 8. How v3 addresses the v2 review
 
-| # | Risk / decision | Mitigation / recommendation |
+| # | v2 problem | v3 resolution |
 |---|---|---|
-| R1 | **dbt v1 (Python) vs v2 (`dbt-oss`, Rust)**: the Python adapters don't support v2 catalogs, and the v2 Python API story is unclear | Start on dbt-core 1.x behind the `TransformEngine` port, track v2 adapter maturity for Trino, and switch through configuration |
-| R2 | **Chainlit is community-maintained** (the original team stepped back in May 2025), and it has had critical CVEs (for example CVE-2026-45018) | Pin ≥ 2.12 and keep it patched. Run it behind an OIDC proxy with no direct internet exposure. Keep it a thin adapter so Open WebUI or a React UI can replace it |
-| R3 | **Auto Ontology maturity**: no library API, NVIDIA-hosted models by default, unauthenticated ingestion endpoints | Sidecar plus adapter isolation, self-hosted model endpoints, private networking. The SDK-owned Ossie/RDF model keeps ontology data portable if the project stalls |
-| R4 | **Apache Ossie is incubating** (spec 0.1.x, 0.2 in draft) | Version the codec, keep RDF/OWL as the internal canonical form, and treat Ossie as the interchange format only |
-| R5 | **Operational footprint** (Polaris, Trino, OpenSearch, OpenMetadata, Keycloak, OpenFGA, Postgres) | Profiles (§3.2). Postgres and OpenSearch are shared across components. Managed-service adapters where a customer prefers them |
-| R6 | **Object storage choice** for self-hosting | SeaweedFS (simple) vs Ceph RGW (enterprise). Either sits behind the S3 API, so the decision can be made per deployment |
+| 1 | Auto Ontology ran SQL outside end-user access control and had its own sign-in | Removed. One query path, always as the caller's role. |
+| 2 | Five stores of business meaning with a sync cycle | Git (`glossary.yml` + dbt) is the source; one-way sync to OpenMetadata. |
+| 3 | DuckDB in dev vs Trino in prod; DuckLake vs Iceberg | Trino and Iceberg in every profile. DuckDB removed. |
+| 4 | Three authorization systems; stale ACL tags; a check per hit | One `access.yml`; attribute-based index filter; no per-hit calls. |
+| 5 | ~15 services; security left to the last phase | Seven containers on two VMs; access control and sign-in start in phases 0–1. |
+| 6 | Synchronous ports | All I/O ports are `async`; searches run concurrently. |
+| 7 | No browsing UI | OpenMetadata's UI is the browser; Chainlit links into it. |
+| 8 | Hosted LLM with no data rule | Classification-based LLM data gate. |
+| 9 | Metadata indexed twice without a reason | Reason stated (§4.4); same cluster. |
+| 10 | Missing index deletes, backup, sizing | Incremental index with deletes (§4.4); backup runbook in phase 5; GPU note in §2.1. |
 
-| R7 | **ADLS Gen2 parity**: Azurite's limited DFS emulation can hide hierarchical-namespace behaviour, and some features (Polaris SAS vending, DuckDB writes) mature more slowly on Azure than on S3 | Run the nightly integration suite against a real ADLS Gen2 account. Gate releases on a storage parity matrix (S3 vs ADLS) |
-| R8 | **LangGraph abstractions leaking** into application code, and churn in LangChain packages | LangGraph is confined to `adapters/agent/` behind the `AgentRuntime` port (enforced by import-linter). Pin `langgraph`/`langchain-core` in `uv.lock` and run the agent tests on every upgrade |
+---
 
-### Decision log
+## 9. Removed from v2
+
+| Removed | Why | How to get it back |
+|---|---|---|
+| NVIDIA Auto Ontology | Bypassed access control, second sign-in system, no library API | Implement `OntologySource` against it, generation only |
+| RDF/OWL, SHACL, SPARQL, Oxigraph, Ossie codec | No consumer needed formal reasoning | Add an exporter from `glossary.yml` |
+| Dagster | A CLI plus any scheduler is enough | Wrap `datalake run` steps as assets |
+| DuckDB, DuckLake, LanceDB, bm25s | Caused dev/prod differences | — |
+| Qdrant, pgvector adapters | One index back end is enough | Implement `VectorIndex` |
+| OpenFGA, OPA | One policy file covers role-based needs | See §2.2 |
+| OpenBao, SPIFFE/SPIRE, service mesh, Kyverno | Platform concerns, not SDK concerns | Platform team's choice |
+| Separate REST API | MCP is the programmatic API | Add a FastAPI adapter over the same services |
+| Docling, Presidio, OpenLineage | Not needed for the core | See §2.2 |
+| Kubernetes, Helm, External Secrets, NetworkPolicies (v4) | Target is two VMs with Docker Compose | Package the same images in a Helm chart |
+| S3 adapter, SeaweedFS (v4) | Azure only | Implement `ObjectStore` for S3 |
+| Keycloak (v4) | Entra ID is already there | Any OIDC provider works with a new identity adapter |
+| Polaris credential vending, cosign signing (v4) | Managed identity covers storage; digests pin images | — |
+
+---
+
+## 10. Risks and items to verify
+
+### Verification results (checked against official documentation, 2026-11-18)
+
+These are documentation checks. None has been run yet; the phase 1 spike must prove the two "partly confirmed" items on a real VM.
+
+| # | Claim | Result | What the docs say | Action |
+|---|---|---|---|---|
+| V1 | dlt can write Iceberg tables registered in a REST catalog (Polaris) | ✅ Confirmed | dlt uses PyIceberg's `load_catalog`, so REST catalogs work (`iceberg_catalog_type = "rest"`). With Iceberg, the `abfss://` scheme is required; `az://` is not supported. | Use `abfss://` URLs only. |
+| V1b | dlt can sign in to ADLS with a managed identity | ⚠️ Partly | dlt documents account key, SAS token and service principal. It also says key and token can be omitted when Azure credentials are already set up on the machine, but does not name managed identity. | Test in phase 1. Fallback: service principal from Key Vault. |
+| V2a | Trino can sign in to ADLS with a managed identity | ✅ Confirmed, with a condition | `azure.auth-type=DEFAULT` supports a **user-assigned** managed identity (`azure.user-assigned-managed-identity.client-id`). System-assigned identity is not documented. | Use a user-assigned identity on VM 1 (§4.1). |
+| V2b | Polaris can sign in to ADLS with a managed identity | ⚠️ Partly | Polaris uses the Azure SDK's `DefaultAzureCredential`, but its docs only describe a service principal set through `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` and `AZURE_CLIENT_SECRET`. It needs `Storage Blob Data Contributor`. | Test the user-assigned identity in phase 1. Fallback: service principal from Key Vault. |
+| V3 | Trino file-based access control supports masks, row filters and per-role impersonation | ✅ Confirmed | Table rules take `filter` and a per-column `mask`; `impersonation` rules map `original_user` to `new_user`; `security.refresh-period` reloads the file without a restart. | None. |
+| V4 | OpenMetadata's dbt ingestion runs without Airflow | ✅ Confirmed | `metadata ingest -c <yaml>` after installing `openmetadata-ingestion[dbt]`. Artifacts can be read from a local path or from Azure storage. | The pipeline calls this CLI step. |
+| V5 | Version numbers | ✅ Confirmed for what we pin | Latest on PyPI: `dbt-core` 1.12.7 (Python ≥ 3.10), `chainlit` 2.12.0. Polaris documentation is published for release 1.7.0. The dbt 2.0 release date and the Chainlit CVE number were not confirmed from official sources and nothing in this design depends on them. | Pin these versions in phase 0. |
+| V6 | Claude is available inside Azure | ✅ Confirmed | Claude is generally available in Microsoft Foundry, with an Azure-hosted option. Which models are offered differs by option and region. | Optional. Check the Foundry model table before choosing it over the Anthropic API. |
+
+### Risks
+
+| # | Risk | Mitigation |
+|---|---|---|
+| R1 | dbt-core 1.x is the older line; Python adapters may lose support | `TransformEngine` port; only artifacts are consumed |
+| R2 | Chainlit is community-maintained and has had critical CVEs | Pin and patch; keep behind OIDC; thin adapter so it can be replaced |
+| R3 | Per-role Trino users mean Trino's own logs show the role, not the person | The SDK audit log records the real user for every query |
+| R4 | Azurite hides hierarchical-namespace behaviour | Nightly suite against a real ADLS Gen2 account |
+| R5 | LangGraph and LangChain package churn | Confined to `adapters/agent/`; pinned; agent tests on every upgrade |
+| R6 | The glossary is weaker than a formal ontology | `OntologySource` port; exporter can be added without redesign |
+| R7 | The reranker is slow on CPU, and the VMs have no GPU | Measure in phase 3. Lower `candidate_k` from 50 to 20–30, or switch to a smaller reranker (`BAAI/bge-reranker-base`) |
+| R8 | No high availability: each VM is a single point of failure | Accepted for this design. Fast rebuild from Bicep plus nightly backups; lake data is safe in ADLS |
+| R9 | Single-node Trino caps dbt run size at one VM's memory | Resize the VM; add Trino worker VMs if needed (§2.2) |
+| R10 | VM 2 is crowded (OpenSearch, OpenMetadata, Postgres, TEI, app) and may contend for memory | Set container memory limits; load-test in phase 5; resize or move TEI to VM 1 |
+
+---
+
+## 11. Decision log
 
 | # | Decision | Status | Date |
 |---|---|---|---|
-| D1 | **OpenMetadata** is the metadata system of record (DataHub kept as an alternative adapter) | ✅ Accepted | 2026-11-18 |
-| D2 | **OpenSearch** alone is the default hybrid index (BM25 + k-NN); fusion stays in the SDK | ✅ Accepted | 2026-11-18 |
-| D3 | **LangGraph** is the agent framework, isolated behind the `AgentRuntime` port | ✅ Accepted | 2026-11-18 |
-| D4 | LLM posture: **hosted API by default (Anthropic Claude)**, with an OpenAI-compatible self-host adapter available; full air-gapped mode is not a phase-1 gate and is hardened in phase 5 | ✅ Accepted | 2026-11-18 |
-| D6 | Storage layer is **multi-protocol**: S3-compatible **and Azure Data Lake Storage Gen2** are both first-class targets behind the `ObjectStore` port | ✅ Accepted | 2026-11-18 |
-| D5 | dbt starting point: **dbt-core 1.x Python** (`DbtCoreRunner`, `dbt-trino` + `dbt-duckdb`) now; `dbt-oss` v2 (`DbtOssCliRunner`) evaluated in phase 5 and adopted through configuration | ✅ Accepted | 2026-11-18 |
+| D1 | OpenMetadata is the metadata system of record | ✅ Accepted | 2026-11-18 |
+| D2 | OpenSearch alone is the hybrid index; fusion stays in the SDK | ✅ Accepted | 2026-11-18 |
+| D3 | LangGraph is the agent framework, behind `AgentRuntime` | ✅ Accepted | 2026-11-18 |
+| D4 | Hosted Claude by default; self-hosted adapter available | ✅ Accepted | 2026-11-18 |
+| D5 | dbt-core 1.x now; dbt v2 later through configuration | ✅ Accepted | 2026-11-18 |
+| D6 | ~~S3-compatible and ADLS Gen2 are both first-class storage targets~~ | ↩️ Superseded by D12 | 2026-11-18 |
+| D7 | Drop Auto Ontology; simplify to lakehouse, dbt, metadata, agent and MCP | ✅ Accepted | 2026-11-18 |
+| D8 | Trino is the only SQL engine, in every profile | ✅ Accepted | 2026-11-18 |
+| D9 | The ontology is `glossary.yml` in Git, synced one-way to OpenMetadata | ✅ Accepted | 2026-11-18 |
+| D10 | One `access.yml` policy, compiled to Trino rules and a search filter; queries run as per-role Trino users | ✅ Accepted | 2026-11-18 |
+| D11 | No orchestrator and no REST API in the core | ✅ Accepted | 2026-11-18 |
+| D12 | Azure only: ADLS Gen2 for storage, two Azure VMs for compute and applications, Docker Compose, no Kubernetes | ✅ Accepted | 2026-11-18 |
+| D13 | VM split: VM 1 runs Trino, Polaris and the pipeline; VM 2 runs the apps, OpenMetadata, OpenSearch, Postgres and TEI | ✅ Accepted | 2026-11-18 |
+| D14 | Microsoft Entra ID for sign-in and Azure Key Vault for secrets (the only Azure services used besides ADLS and the VMs) | ✅ Accepted | 2026-11-18 |
+| D15 | Postgres and OpenSearch are self-hosted on VM 2, not Azure managed services | ✅ Accepted | 2026-11-18 |
 
 ---
 
-## 9. References
+## 12. References
 
-- NVIDIA Auto Ontology — https://github.com/NVIDIA/auto-ontology
-- dbt 2.0 / `dbt-oss` and the built-in DuckDB adapter — https://duckdb.org/2026/09/22/dbt-fusion
-- dbt release tracks — https://docs.getdbt.com/docs/dbt-versions.md · dbt Iceberg + DuckDB support — https://docs.getdbt.com/docs/build/iceberg/adapters/duckdb-iceberg-support
-- State of Apache Polaris (July 2026) — https://datalakehousehub.com/blog/state-of-apache-polaris-july-2026
-- Iceberg catalog comparison — https://www.dremio.com/blog/choosing-an-apache-iceberg-catalog-polaris-gravitino-unity-lakekeeper-and-more
-- Apache Ossie (Open Semantic Interchange) — https://www.snowflake.com/it/blog/apache-ossie-open-semantic-interchange-incubator/ · https://atlan.com/know/ai-agent/semantic-layer/what-is-open-semantic-interchange/
-- OpenMetadata vs DataHub — https://atlan.com/openmetadata-vs-datahub · https://www.decube.io/post/open-source-data-catalog-comparison
+- dbt 2.0 / `dbt-oss` — https://duckdb.org/2026/09/22/dbt-fusion · https://docs.getdbt.com/docs/dbt-versions.md
+- Apache Polaris — https://datalakehousehub.com/blog/state-of-apache-polaris-july-2026
+- OpenMetadata vs DataHub — https://atlan.com/openmetadata-vs-datahub
 - Vector database comparison 2026 — https://bigdataboutique.com/blog/vector-database-comparison-2026
-- Chainlit maintenance status — https://pypi.org/pypi/chainlit/ · https://www.issoh.co.jp/md/tech/4839
-- MCP specification (authorization) — https://modelcontextprotocol.io/specification
-- LangGraph — https://github.com/langchain-ai/langgraph · LangChain MCP adapters — https://github.com/langchain-ai/langchain-mcp-adapters
-- OWASP Top 10 for LLM Applications — https://genai.owasp.org/
+- Chainlit — https://pypi.org/pypi/chainlit/
+- dlt Iceberg destination — https://dlthub.com/docs/dlt-ecosystem/destinations/iceberg · filesystem credentials — https://dlthub.com/docs/dlt-ecosystem/destinations/filesystem
+- Trino Azure file system — https://trino.io/docs/current/object-storage/file-system-azure.html · file-based access control — https://trino.io/docs/current/security/file-system-access-control.html
+- Polaris on Azure storage — https://polaris.apache.org/releases/1.7.0/configuration/configuring-polaris-for-production/configuring-azure-blob-cloud-storage-specific/
+- OpenMetadata dbt ingestion run externally — https://docs.open-metadata.org/latest/connectors/ingestion/workflows/dbt/run-dbt-workflow-externally
+- Claude in Microsoft Foundry — https://learn.microsoft.com/en-my/Azure/foundry/foundry-models/concepts/claude-models
+- LangGraph — https://github.com/langchain-ai/langgraph
+- MCP specification — https://modelcontextprotocol.io/specification
+- NVIDIA Auto Ontology (evaluated, not adopted) — https://github.com/NVIDIA/auto-ontology

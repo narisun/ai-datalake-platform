@@ -1,0 +1,17 @@
+name: datalake
+version: "0.1.0"
+profile: datalake
+
+model-paths: ["models"]
+
+# Every model must say which business domain it belongs to and how sensitive it is.
+# The SDK reads these to build Trino access rules and the search filter. A model with
+# no domain is visible to nobody, and one with no classification is treated as restricted.
+models:
+  datalake:
+    staging:
+      +schema: staging
+      +materialized: view
+    marts:
+      +schema: marts
+      +materialized: table

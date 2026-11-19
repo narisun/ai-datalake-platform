@@ -1,0 +1,1 @@
+"""The metadata catalog (OpenMetadata)."""
