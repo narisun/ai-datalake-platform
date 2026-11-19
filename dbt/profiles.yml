@@ -1,13 +1,18 @@
+# Connection settings come from the environment, which `dl transform` fills in from
+# the control database. Trino requires sign-in over HTTPS.
 datalake:
   target: dev
   outputs:
     dev:
       type: trino
-      method: none
+      method: ldap  # dbt-trino's name for user name and password
       user: "{{ env_var('TRINO_USER', 'svc_pipeline') }}"
+      password: "{{ env_var('TRINO_PASSWORD', 'not-set') }}"
       host: "{{ env_var('TRINO_HOST', 'localhost') }}"
-      port: "{{ env_var('TRINO_PORT', '8080') | int }}"
-      http_scheme: "{{ env_var('TRINO_SCHEME', 'http') }}"
+      port: "{{ env_var('TRINO_PORT', '8443') | int }}"
+      http_scheme: "{{ env_var('TRINO_SCHEME', 'https') }}"
+      # The certificate to trust. Unset means the system's own trusted certificates.
+      cert: "{{ env_var('TRINO_CERT', '') or true }}"
       database: "{{ env_var('TRINO_CATALOG', 'lake') }}"
       schema: analytics
       threads: 4

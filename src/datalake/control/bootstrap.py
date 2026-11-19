@@ -6,6 +6,7 @@ to reach it:
     DL_DATABASE_URL    the control database (required)
     DL_STRICT_CONFIG   "1" to refuse configuration from environment variables
     DL_GIT_COMMIT      recorded on each run (set when the image is built)
+    DL_SECRETS_DIR     optional directory of secret files, one file per secret
 """
 
 from __future__ import annotations
@@ -19,9 +20,15 @@ from dotenv import dotenv_values
 
 from datalake.control.config import ConfigResolver
 from datalake.control.errors import ConfigError
-from datalake.control.ports import ControlStore
+from datalake.control.ports import ControlStore, SecretResolver
 from datalake.control.postgres import PostgresControlStore
-from datalake.control.runtime import EnvironmentSecrets, SystemClock, Uuid7Generator
+from datalake.control.runtime import (
+    ChainedSecrets,
+    EnvironmentSecrets,
+    FileSecrets,
+    SystemClock,
+    Uuid7Generator,
+)
 from datalake.control.service import Control
 
 DATABASE_URL = "DL_DATABASE_URL"
@@ -52,12 +59,21 @@ def open_store(environment: Mapping[str, str]) -> PostgresControlStore:
     return PostgresControlStore.connect(database_url(environment))
 
 
+def build_secrets(environment: Mapping[str, str]) -> SecretResolver:
+    """Environment variables first, then files in DL_SECRETS_DIR if it is set."""
+    resolvers: list[SecretResolver] = [EnvironmentSecrets(environment)]
+    directory = environment.get("DL_SECRETS_DIR")
+    if directory:
+        resolvers.append(FileSecrets(Path(directory)))
+    return ChainedSecrets(resolvers)
+
+
 def build_control(environment: Mapping[str, str], store: ControlStore | None = None) -> Control:
     return Control(
         store=store if store is not None else open_store(environment),
         resolver=ConfigResolver(
             environment=environment,
-            secrets=EnvironmentSecrets(environment),
+            secrets=build_secrets(environment),
             strict=environment.get("DL_STRICT_CONFIG", "") == "1",
         ),
         clock=SystemClock(),

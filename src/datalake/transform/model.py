@@ -10,3 +10,6 @@ class RunResult:
     success: bool
     models_built: tuple[str, ...]
     artifacts_dir: str
+    # One line per model, test or source that failed, for the person reading the run.
+    problems: tuple[str, ...] = ()
+    warnings: tuple[str, ...] = ()

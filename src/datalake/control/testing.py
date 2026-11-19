@@ -8,7 +8,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from datalake.control.errors import ProcessNotRegisteredError, SecretNotFoundError
-from datalake.control.model import ConfigEntry, Process, RunRecord, RunStart, RunStatus
+from datalake.control.model import (
+    ConfigEntry,
+    IngestedFile,
+    Process,
+    RunRecord,
+    RunStart,
+    RunStatus,
+)
 
 _PROCESS_NAME = re.compile(r"[a-z][a-z0-9-]*")
 _CONFIG_KEY = re.compile(r"[a-z][a-z0-9_]*")
@@ -22,6 +29,7 @@ class InMemoryControlStore:
         self._runs: dict[str, dict[str, Any]] = {}
         self._steps: dict[int, dict[str, Any]] = {}
         self._watermarks: dict[tuple[int, str], str] = {}
+        self._files: dict[tuple[int, str, str], IngestedFile] = {}
 
     # Processes
 
@@ -160,6 +168,22 @@ class InMemoryControlStore:
 
     def set_watermark(self, process_id: int, object_name: str, value: str) -> None:
         self._watermarks[(process_id, object_name)] = value
+
+    # File ledger
+
+    def get_ingested_file(self, process_id: int, source: str, path: str) -> IngestedFile | None:
+        return self._files.get((process_id, source, path))
+
+    def record_ingested_file(self, process_id: int, file: IngestedFile) -> None:
+        self._files[(process_id, file.source, file.path)] = file
+
+    def list_ingested_files(self, process_id: int, source: str | None) -> Sequence[IngestedFile]:
+        files = [
+            file
+            for (owner, _, _), file in self._files.items()
+            if owner == process_id and (source is None or file.source == source)
+        ]
+        return sorted(files, key=lambda file: (file.source, file.path))
 
     # For tests
 

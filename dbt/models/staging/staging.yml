@@ -2,12 +2,15 @@ version: 2
 
 # Tagging rules (read by both the access policy and OpenMetadata):
 #   tags                       exactly one of: public, internal, confidential, restricted
+#                              and no other tags
 #   meta.openmetadata.domain   the business domain; must exist in OpenMetadata
 #   meta.owner                 the owning team
 
 models:
   - name: stg_orders
-    description: Orders with clean types.
+    description: >
+      Orders, typed, one row per order (the most recently loaded). A row that could
+      not be typed has a reject_reason and is left out of the canonical layer.
     config:
       tags: [internal]
       meta:
@@ -21,12 +24,20 @@ models:
       - name: customer_id
         description: Customer who placed the order.
       - name: ordered_at
-        description: When the order was placed.
+        description: When the order was placed. Null if the text was not a date and time.
       - name: amount
-        description: Order total.
+        description: Order total. Null if the text was not a number.
+      - name: reject_reason
+        description: Why the row cannot be used; null for a valid row.
+      - name: source_file
+        description: The landing file this row came from.
+      - name: loaded_at
+        description: When that file was loaded.
 
   - name: stg_customers
-    description: Customers with clean types. Holds personal data.
+    description: >
+      Customers, typed, from the latest customer file. Holds personal data. A row with
+      a missing name or an invalid email has a reject_reason.
     config:
       tags: [confidential]
       meta:
@@ -42,4 +53,32 @@ models:
       - name: email
         description: Customer's email address, lower-cased.
       - name: country
-        description: Country of residence.
+        description: Country of residence, upper-cased.
+      - name: reject_reason
+        description: Why the row cannot be used; null for a valid row.
+      - name: source_file
+        description: The landing file this row came from.
+      - name: loaded_at
+        description: When that file was loaded.
+
+  - name: rejected_rows
+    description: >
+      Every row that arrived but could not be used, with the reason and the file it
+      came from. Send this back to whoever supplied the file.
+    config:
+      tags: [internal]
+      meta:
+        owner: sales-data
+        openmetadata:
+          domain: sales
+    columns:
+      - name: entity
+        description: Which kind of record was rejected.
+      - name: business_key
+        description: The record's identifier in its source.
+      - name: reject_reason
+        description: Why it was rejected.
+      - name: source_file
+        description: The landing file it came from.
+      - name: loaded_at
+        description: When that file was loaded.

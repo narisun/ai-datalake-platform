@@ -3,4 +3,4 @@ select
     full_name,
     email,
     country
-from {{ ref('stg_customers') }}
+from {{ ref('customer') }}

@@ -10,8 +10,10 @@ The design is in [docs/architecture/PLATFORM_PROPOSAL.md](docs/architecture/PLAT
 
 Built so far: the control module (registered processes, configuration, run records),
 the access policy and Trino rule generator, the dbt runner and manifest reader, the
-storage adapter, and the hybrid retriever. A spike stack in `deploy/compose/spike`
-proves OpenMetadata, Airflow, Trino and dbt work together.
+storage adapter, file ingestion, the search index built from OpenMetadata, hybrid search,
+and a question-answering agent (`dl ask`) that writes read-only SQL and runs it as the
+asker's role. The whole platform runs in containers from `deploy/compose/dev`.
+Not built yet: the MCP server and the Chainlit UI.
 
 ## Control
 
@@ -26,6 +28,10 @@ dl config set batch_size=5000 --process ingest
 dl config import .env                   # move DL_* values from a .env file
 dl config doctor                        # list values still only in .env
 dl runs
+dl ingest                               # load new and changed landing files
+dl files                                # what ingestion did with each file
+dl transform                            # build the dbt project
+dl check-tags --manifest target/manifest.json   # every model tagged correctly?
 ```
 
 Only `DL_DATABASE_URL` must come from the environment or `.env`. While values are
@@ -40,7 +46,7 @@ src/datalake/
   control/     registered processes, configuration, run records
   policy/      the access policy, its file format, Trino rule generation
   storage/     object storage (ADLS Gen2, Azurite) and the table catalog
-  ingest/      loading sources into the raw layer
+  ingest/      loading landing files (CSV, Excel, Parquet) into the raw layer
   transform/   running dbt and reading its artifacts
   catalog/     the metadata catalog (OpenMetadata)
   search/      hybrid search: BM25, vectors, fusion, rerank

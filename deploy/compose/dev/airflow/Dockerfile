@@ -11,7 +11,7 @@ COPY --chown=airflow:0 pyproject.toml README.md LICENSE /opt/datalake/src/
 COPY --chown=airflow:0 src /opt/datalake/src/src
 
 RUN python -m venv /opt/datalake/venv \
-    && /opt/datalake/venv/bin/pip install --no-cache-dir "/opt/datalake/src[dbt,storage]"
+    && /opt/datalake/venv/bin/pip install --no-cache-dir "/opt/datalake/src[dbt,storage,ingest,search,agent]"
 
 # Only `dl` goes on the PATH; the environment's own python must not shadow Airflow's.
 USER root

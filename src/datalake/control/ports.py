@@ -11,7 +11,14 @@ from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import Protocol
 
-from datalake.control.model import ConfigEntry, Process, RunRecord, RunStart, RunStatus
+from datalake.control.model import (
+    ConfigEntry,
+    IngestedFile,
+    Process,
+    RunRecord,
+    RunStart,
+    RunStatus,
+)
 
 
 class ControlStore(Protocol):
@@ -74,6 +81,17 @@ class ControlStore(Protocol):
     def get_watermark(self, process_id: int, object_name: str) -> str | None: ...
 
     def set_watermark(self, process_id: int, object_name: str, value: str) -> None: ...
+
+    # File ledger
+    def get_ingested_file(self, process_id: int, source: str, path: str) -> IngestedFile | None: ...
+
+    def record_ingested_file(self, process_id: int, file: IngestedFile) -> None:
+        """Insert, or replace the earlier record for the same source and path."""
+        ...
+
+    def list_ingested_files(self, process_id: int, source: str | None) -> Sequence[IngestedFile]:
+        """Ordered by source, then path."""
+        ...
 
 
 class SecretResolver(Protocol):

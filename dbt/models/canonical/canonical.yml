@@ -1,0 +1,79 @@
+version: 2
+
+# The canonical layer is the agreed definition of each business entity. A contract
+# fixes each model's column names and types: a change that would break them fails the
+# build instead of reaching the people and agents who rely on them.
+
+models:
+  - name: customer
+    description: >
+      A person or organisation that has placed, or may place, an order. One row per
+      customer, valid rows only. Name and email are personal data.
+    config:
+      tags: [internal]
+      contract:
+        enforced: true
+      meta:
+        owner: sales-data
+        openmetadata:
+          domain: sales
+          glossary: ["Business.Customer"]
+    columns:
+      - name: customer_id
+        description: Customer identifier.
+        data_type: varchar
+        data_tests: [unique, not_null]
+      - name: full_name
+        description: Customer's full name.
+        data_type: varchar
+        config:
+          tags: [confidential]
+        data_tests: [not_null]
+      - name: email
+        description: Customer's email address, lower-cased.
+        data_type: varchar
+        config:
+          tags: [confidential]
+        data_tests: [not_null]
+      - name: country
+        description: Country of residence, as a two-letter code.
+        data_type: varchar
+
+  - name: sales_order
+    description: >
+      A customer's request to buy, with its total. One row per order, valid rows only,
+      reflecting the latest correction received.
+    config:
+      tags: [internal]
+      contract:
+        enforced: true
+      meta:
+        owner: sales-data
+        openmetadata:
+          domain: sales
+          glossary: ["Business.Order"]
+    columns:
+      - name: order_id
+        description: Order identifier.
+        data_type: varchar
+        data_tests: [unique, not_null]
+      - name: customer_id
+        description: Customer who placed the order.
+        data_type: varchar
+        data_tests:
+          - not_null
+          # An order for a customer we do not know is worth a warning, not a stopped build.
+          - relationships:
+              arguments:
+                to: ref('customer')
+                field: customer_id
+              config:
+                severity: warn
+      - name: ordered_at
+        description: When the order was placed.
+        data_type: timestamp(6)
+        data_tests: [not_null]
+      - name: amount
+        description: Order total.
+        data_type: decimal(18,2)
+        data_tests: [not_null]

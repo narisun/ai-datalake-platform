@@ -1,0 +1,38 @@
+version: 2
+
+# These run with made-up rows, so they prove the logic whatever data is in the lake.
+unit_tests:
+  - name: stg_orders_keeps_the_latest_row_and_marks_bad_values
+    model: stg_orders
+    given:
+      - input: source('raw', 'orders')
+        rows:
+          # Order 1 arrives twice; the later load is a correction and must win.
+          - {order_id: "1", customer_id: "7", ordered_at: "2026-11-01 10:00:00", amount: "10.00", _source_file: "a.csv", _row_number: 1, _loaded_at: "2026-11-01 00:00:00 UTC"}
+          - {order_id: " 1 ", customer_id: "7", ordered_at: "2026-11-01 10:00:00", amount: "12.50", _source_file: "b.csv", _row_number: 1, _loaded_at: "2026-11-02 00:00:00 UTC"}
+          # Bad values are kept and explained, not dropped and not fatal.
+          - {order_id: "2", customer_id: "7", ordered_at: "2026-11-01 10:00:00", amount: "abc", _source_file: "a.csv", _row_number: 2, _loaded_at: "2026-11-01 00:00:00 UTC"}
+          - {order_id: "3", customer_id: "7", ordered_at: "yesterday", amount: "5", _source_file: "a.csv", _row_number: 3, _loaded_at: "2026-11-01 00:00:00 UTC"}
+          - {order_id: "4", customer_id: "  ", ordered_at: "2026-11-01 10:00:00", amount: "5", _source_file: "a.csv", _row_number: 4, _loaded_at: "2026-11-01 00:00:00 UTC"}
+          # A row with no order id cannot be identified at all and is left out.
+          - {order_id: null, customer_id: "7", ordered_at: "2026-11-01 10:00:00", amount: "5", _source_file: "a.csv", _row_number: 5, _loaded_at: "2026-11-01 00:00:00 UTC"}
+    expect:
+      rows:
+        - {order_id: "1", amount: 12.50, reject_reason: null, source_file: "b.csv"}
+        - {order_id: "2", amount: null, reject_reason: "amount is not a number: abc", source_file: "a.csv"}
+        - {order_id: "3", amount: 5.00, reject_reason: "ordered_at is not a date and time: yesterday", source_file: "a.csv"}
+        - {order_id: "4", amount: 5.00, reject_reason: "customer_id is missing", source_file: "a.csv"}
+
+  - name: stg_customers_cleans_text_and_marks_bad_emails
+    model: stg_customers
+    given:
+      - input: source('raw', 'customers')
+        rows:
+          - {customer_id: " 1 ", full_name: " Ada Lovelace ", email: "ADA@Example.com", country: "gb", _source_file: "c.xlsx", _loaded_at: "2026-11-01 00:00:00 UTC"}
+          - {customer_id: "2", full_name: "Alan Turing", email: "not-an-email", country: "GB", _source_file: "c.xlsx", _loaded_at: "2026-11-01 00:00:00 UTC"}
+          - {customer_id: "3", full_name: "", email: "x@example.com", country: "US", _source_file: "c.xlsx", _loaded_at: "2026-11-01 00:00:00 UTC"}
+    expect:
+      rows:
+        - {customer_id: "1", full_name: "Ada Lovelace", email: "ada@example.com", country: "GB", reject_reason: null}
+        - {customer_id: "2", full_name: "Alan Turing", email: "not-an-email", country: "GB", reject_reason: "email is not an address: not-an-email"}
+        - {customer_id: "3", full_name: null, email: "x@example.com", country: "US", reject_reason: "full_name is missing"}

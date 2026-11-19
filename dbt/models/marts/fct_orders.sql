@@ -4,6 +4,6 @@ select
     c.country,
     o.ordered_at,
     o.amount
-from {{ ref('stg_orders') }} as o
-left join {{ ref('dim_customer') }} as c
+from {{ ref('sales_order') }} as o
+left join {{ ref('customer') }} as c
     on o.customer_id = c.customer_id

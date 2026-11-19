@@ -83,3 +83,28 @@ def create_azurite_store(container: str, prefix: str | None = None) -> AzureStor
     hierarchical namespace: renames and directory operations are not covered.
     """
     return AzureStore(container_name=container, prefix=prefix, use_emulator=True)
+
+
+def create_landing_store(
+    account: str,
+    container: str,
+    endpoint: str | None = None,
+    account_key: str | None = None,
+    managed_identity_client_id: str | None = None,
+) -> AzureStore:
+    """The store for a container, on real ADLS Gen2 or on Azurite.
+
+    Azurite: pass its `endpoint` (for example http://azurite:10000/devstoreaccount1)
+    and its account key. ADLS Gen2: pass neither, and the managed identity's client id.
+    """
+    if endpoint is None:
+        return create_adls_gen2_store(account, container, managed_identity_client_id)
+    if account_key is None:
+        raise ValueError("an endpoint (Azurite) needs its account key")
+    return AzureStore(
+        container_name=container,
+        account_name=account,
+        endpoint=endpoint,
+        account_key=account_key,
+        client_options={"allow_http": endpoint.startswith("http://")},
+    )

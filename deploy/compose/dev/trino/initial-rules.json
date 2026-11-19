@@ -1,0 +1,25 @@
+{
+  "catalogs": [
+    {"user": "svc_pipeline", "catalog": "lake", "allow": "all"},
+    {"user": "svc_pipeline", "catalog": "system", "allow": "read-only"},
+    {"user": "svc_catalog", "catalog": "lake", "allow": "read-only"},
+    {"allow": "none"}
+  ],
+  "schemas": [
+    {"user": "svc_pipeline", "catalog": "lake", "owner": true},
+    {"owner": false}
+  ],
+  "tables": [
+    {"user": "svc_pipeline", "catalog": "system", "privileges": ["SELECT"]},
+    {
+      "user": "svc_pipeline",
+      "catalog": "lake",
+      "privileges": ["SELECT", "INSERT", "DELETE", "UPDATE", "OWNERSHIP", "GRANT_SELECT"]
+    },
+    {"user": "svc_catalog", "catalog": "lake", "privileges": ["SELECT"]},
+    {"privileges": []}
+  ],
+  "impersonation": [
+    {"original_user": ".*", "new_user": ".*", "allow": false}
+  ]
+}

@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Literal
 
 RunStatus = Literal["running", "succeeded", "failed"]
+FileStatus = Literal["loaded", "rejected", "superseded"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,3 +52,16 @@ class RunRecord:
     ended_at: datetime | None
     error: str | None
     airflow_run_id: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class IngestedFile:
+    """What ingestion did with one file. `content_hash` detects a corrected re-upload."""
+
+    source: str
+    path: str
+    content_hash: str
+    status: FileStatus
+    rows_loaded: int | None = None
+    error: str | None = None
+    run_id: str | None = None
