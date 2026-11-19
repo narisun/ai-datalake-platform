@@ -1,0 +1,47 @@
+version: 2
+
+models:
+  - name: dim_customer
+    description: One row per customer. Name and email are personal data.
+    config:
+      tags: [internal]
+      meta:
+        owner: sales-data
+        openmetadata:
+          domain: sales
+          glossary: ["Business.Customer"]
+    columns:
+      - name: customer_id
+        description: Customer identifier.
+        data_tests: [unique, not_null]
+      - name: full_name
+        description: Customer's full name.
+        config:
+          tags: [confidential]
+      - name: email
+        description: Customer's email address.
+        config:
+          tags: [confidential]
+      - name: country
+        description: Country of residence.
+
+  - name: fct_orders
+    description: One row per order, with the customer's country. Revenue reporting starts here.
+    config:
+      tags: [internal]
+      meta:
+        owner: sales-data
+        openmetadata:
+          domain: sales
+    columns:
+      - name: order_id
+        description: Order identifier.
+        data_tests: [unique, not_null]
+      - name: customer_id
+        description: Customer who placed the order.
+      - name: country
+        description: Customer's country at the time of reporting.
+      - name: ordered_at
+        description: When the order was placed.
+      - name: amount
+        description: Order total.

@@ -1,0 +1,14 @@
+# Access policy: the single source for who may see what.
+# Roles are Entra ID app roles carried in the user's token.
+# Classification order: public < internal < confidential < restricted
+roles:
+  analyst_sales:
+    domains: [sales]
+    max_classification: internal
+    masks:
+      - column: dim_customer.email
+        expression: "'***'"
+
+  steward_finance:
+    domains: [finance, sales]
+    max_classification: confidential

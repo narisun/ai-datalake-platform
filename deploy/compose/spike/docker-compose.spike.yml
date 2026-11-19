@@ -1,0 +1,50 @@
+# Spike stack: OpenMetadata's reference Compose file plus what the platform adds.
+#
+#   docker compose -p dlspike \
+#     -f docker-compose.openmetadata.yml -f docker-compose.spike.yml up -d
+#
+# docker-compose.openmetadata.yml is OpenMetadata 2.0.8's own quickstart file
+# (Apache-2.0), copied unchanged. This file only adds to it.
+#
+# Not for production: default passwords, no TLS, no sign-in provider.
+
+services:
+  trino:
+    image: trinodb/trino:latest
+    container_name: dlspike_trino
+    ports:
+      - "8090:8080"
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
+      - trino-lake:/data/lake
+    networks:
+      - app_net
+    healthcheck:
+      test: ["CMD", "trino", "--execute", "select 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+
+  # Azure's storage emulator. It speaks the Blob API only: enough for the platform's
+  # own storage code, but not for Trino, which needs ADLS Gen2's hierarchical namespace.
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    container_name: dlspike_azurite
+    command: azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --skipApiVersionCheck
+    ports:
+      - "10000:10000"
+    networks:
+      - app_net
+
+  ingestion:
+    volumes:
+      # The platform's pipeline definitions, beside the ones OpenMetadata generates.
+      - ./dags:/opt/airflow/dags/platform:ro
+      # The reference dbt project and access policy.
+      - ../../../dbt:/opt/datalake/dbt:ro
+      # Where dbt writes its artifacts, and the platform's own virtual environment.
+      - datalake-work:/opt/datalake/work
+
+volumes:
+  trino-lake:
+  datalake-work:
