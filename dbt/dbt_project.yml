@@ -15,3 +15,6 @@ models:
     marts:
       +schema: marts
       +materialized: table
+      # Replace the table in one atomic step. The default (rename the old table away,
+      # then drop it) is slower on Iceberg and loses the table's history.
+      +on_table_exists: replace

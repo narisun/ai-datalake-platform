@@ -7,6 +7,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -32,12 +35,17 @@ class DbtCoreRunner:
         target_dir: Path,
         log_dir: Path,
         target: str | None = None,
+        environment: Mapping[str, str] | None = None,
+        variables: Mapping[str, str] | None = None,
     ) -> None:
         self._project_dir = project_dir
         self._profiles_dir = profiles_dir
         self._target_dir = target_dir
         self._log_dir = log_dir
         self._target = target
+        # dbt reads connection settings with env_var(), so they are set while it runs.
+        self._environment = dict(environment or {})
+        self._variables = dict(variables or {})
         self._lock = asyncio.Lock()
 
     async def build(self, select: str | None = None) -> RunResult:
@@ -46,6 +54,10 @@ class DbtCoreRunner:
         if select is not None:
             args += ["--select", select]
         return await self._invoke(args)
+
+    async def docs(self) -> RunResult:
+        """Write catalog.json. Run this before `build`: it overwrites run_results.json."""
+        return await self._invoke(["docs", "generate"])
 
     async def parse(self) -> RunResult:
         """Write manifest.json without connecting to the warehouse."""
@@ -67,19 +79,33 @@ class DbtCoreRunner:
         ]
         if self._target is not None:
             args += ["--target", self._target]
+        if self._variables:
+            args += ["--vars", json.dumps(self._variables)]
 
         async with self._lock:
-            outcome = await asyncio.to_thread(dbtRunner().invoke, args)
+            outcome = await asyncio.to_thread(self._run, args)
 
         if outcome.exception is not None:
             raise DbtRunError(
-                f"dbt {command[0]} failed: {outcome.exception}"
+                f"dbt {' '.join(command)} failed: {outcome.exception}"
             ) from outcome.exception
         return RunResult(
             success=bool(outcome.success),
             models_built=_models_built(outcome.result),
             artifacts_dir=str(self._target_dir),
         )
+
+    def _run(self, args: list[str]) -> Any:
+        saved = {name: os.environ.get(name) for name in self._environment}
+        os.environ.update(self._environment)
+        try:
+            return dbtRunner().invoke(args)
+        finally:
+            for name, value in saved.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 def _models_built(result: Any) -> tuple[str, ...]:

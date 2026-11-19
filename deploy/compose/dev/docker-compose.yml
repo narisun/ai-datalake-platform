@@ -1,0 +1,240 @@
+# The platform on one machine: laptop or a single VM.
+#
+#   python deploy/compose/dev/init_env.py          # once: writes .env with generated secrets
+#   docker compose -f deploy/compose/dev/docker-compose.yml up -d --build
+#   docker compose -f deploy/compose/dev/docker-compose.yml exec airflow python /opt/datalake/dev/bootstrap.py
+#
+# Storage in this phase: Iceberg tables live on the shared `lake` volume; the platform's
+# own objects go to Azurite. See docs/architecture/PLATFORM_PROPOSAL.md, section 7.4.
+#
+# Not hardened: no TLS and no sign-in provider. Do not expose these ports beyond the host.
+
+name: datalake
+
+x-openmetadata-env: &openmetadata-env
+  DB_DRIVER_CLASS: org.postgresql.Driver
+  DB_SCHEME: postgresql
+  DB_PARAMS: allowPublicKeyRetrieval=true&useSSL=false&serverTimezone=UTC
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_USER: openmetadata_user
+  DB_USER_PASSWORD: ${OPENMETADATA_DB_PASSWORD:?run init_env.py first}
+  OM_DATABASE: openmetadata_db
+  SEARCH_TYPE: opensearch
+  ELASTICSEARCH_HOST: opensearch
+  ELASTICSEARCH_PORT: "9200"
+  ELASTICSEARCH_SCHEME: http
+  SERVER_HOST_API_URL: http://openmetadata:8585/api
+  PIPELINE_SERVICE_CLIENT_ENDPOINT: http://airflow:8080
+  AIRFLOW_USERNAME: admin
+  AIRFLOW_PASSWORD: admin
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run init_env.py first}
+      OPENMETADATA_DB_PASSWORD: ${OPENMETADATA_DB_PASSWORD}
+      AIRFLOW_DB_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POLARIS_DB_PASSWORD: ${POLARIS_DB_PASSWORD}
+      CONTROL_DB_PASSWORD: ${CONTROL_DB_PASSWORD}
+      SHOP_DB_PASSWORD: ${SHOP_DB_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d datalake_control"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  opensearch:
+    image: opensearchproject/opensearch:3.4.0
+    environment:
+      discovery.type: single-node
+      DISABLE_SECURITY_PLUGIN: "true"
+      DISABLE_INSTALL_DEMO_CONFIG: "true"
+      OPENSEARCH_JAVA_OPTS: -Xms1g -Xmx1g
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    ports:
+      - "9200:9200"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+
+  # Iceberg tables are files on this volume. Trino writes data, Polaris writes metadata,
+  # and they run as different users, so the volume is opened up once at start.
+  lake-init:
+    image: postgres:17
+    user: root
+    entrypoint: ["sh", "-c", "mkdir -p /data/lake && chmod 0777 /data/lake"]
+    volumes:
+      - lake:/data/lake
+
+  polaris-bootstrap:
+    image: apache/polaris-admin-tool:1.7.0
+    environment: &polaris-db
+      POLARIS_PERSISTENCE_TYPE: relational-jdbc
+      QUARKUS_DATASOURCE_DB_KIND: postgresql
+      QUARKUS_DATASOURCE_JDBC_URL: jdbc:postgresql://postgres:5432/polaris
+      QUARKUS_DATASOURCE_USERNAME: polaris
+      QUARKUS_DATASOURCE_PASSWORD: ${POLARIS_DB_PASSWORD}
+    # Bootstrapping a realm twice is an error, so a failure here is tolerated: it is
+    # what happens on every start after the first. A real failure shows up as Polaris
+    # refusing the client credentials.
+    entrypoint:
+      - sh
+      - -c
+      - >-
+        /opt/jboss/container/java/run/run-java.sh bootstrap --realm=POLARIS
+        --credential=POLARIS,${POLARIS_CLIENT_ID},${POLARIS_CLIENT_SECRET}
+        || echo "bootstrap did not run cleanly (expected if the realm already exists)"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  polaris:
+    # A thin image over apache/polaris:1.7.0; see polaris/Dockerfile for why.
+    build: ./polaris
+    image: datalake/polaris:dev
+    environment:
+      <<: *polaris-db
+      POLARIS_REALM_CONTEXT_REALMS: POLARIS
+      # A fixed signing secret, so tokens Trino holds stay valid across Polaris restarts.
+      # Without it Polaris makes new keys at every start and Trino's queries fail.
+      polaris.authentication.token-broker.type: symmetric-key
+      polaris.authentication.token-broker.symmetric-key.secret: ${POLARIS_TOKEN_SECRET:?run init_env.py first}
+      # Local files as catalog storage are for this all-container phase only.
+      polaris.features."SUPPORTED_CATALOG_STORAGE_TYPES": '["FILE","AZURE"]'
+      polaris.features."ALLOW_INSECURE_STORAGE_TYPES": "true"
+      # Trino drops tables with their data files; Polaris refuses that unless enabled.
+      polaris.features."DROP_WITH_PURGE_ENABLED": "true"
+      polaris.readiness.ignore-severe-issues: "true"
+    volumes:
+      - lake:/data/lake
+    ports:
+      - "8181:8181"
+    depends_on:
+      lake-init:
+        condition: service_completed_successfully
+      polaris-bootstrap:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8182/q/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  trino:
+    image: trinodb/trino:484
+    environment:
+      POLARIS_CLIENT_ID: ${POLARIS_CLIENT_ID}
+      POLARIS_CLIENT_SECRET: ${POLARIS_CLIENT_SECRET}
+      SHOP_DB_PASSWORD: ${SHOP_DB_PASSWORD}
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog:ro
+      - lake:/data/lake
+    ports:
+      - "8090:8080"
+    depends_on:
+      lake-init:
+        condition: service_completed_successfully
+      polaris:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "trino", "--execute", "select 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+
+  # Azure's storage emulator, for the platform's own objects (Blob API only).
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:latest
+    command: azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --skipApiVersionCheck --location /data
+    volumes:
+      - azurite-data:/data
+    ports:
+      - "10000:10000"
+
+  openmetadata-migrate:
+    image: docker.getcollate.io/openmetadata/server:2.0.8
+    command: "./bootstrap/openmetadata-ops.sh migrate"
+    environment: *openmetadata-env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      opensearch:
+        condition: service_healthy
+
+  openmetadata:
+    image: docker.getcollate.io/openmetadata/server:2.0.8
+    environment: *openmetadata-env
+    ports:
+      - "8585:8585"
+    depends_on:
+      openmetadata-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8586/healthcheck"]
+      interval: 15s
+      timeout: 10s
+      retries: 30
+
+  # OpenMetadata's Airflow image with the platform installed in its own environment.
+  # It runs the platform's pipelines and OpenMetadata's own workflows.
+  airflow:
+    build:
+      context: ../../..
+      dockerfile: deploy/compose/dev/airflow/Dockerfile
+    image: datalake/airflow:dev
+    environment:
+      AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__OPENMETADATA_AIRFLOW_APIS__DAG_GENERATED_CONFIGS: /opt/airflow/dag_generated_configs
+      # Pick up new pipeline files quickly.
+      AIRFLOW__DAG_PROCESSOR__REFRESH_INTERVAL: "30"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      AIRFLOW_DB: airflow_db
+      DB_USER: airflow_user
+      DB_SCHEME: postgresql+psycopg2
+      DB_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      # The one setting the platform takes from the environment.
+      DL_DATABASE_URL: postgresql://datalake:${CONTROL_DB_PASSWORD}@postgres:5432/datalake_control
+      DL_STRICT_CONFIG: "1"
+      # Used only by bootstrap.py, to set the stack up the first time.
+      POLARIS_CLIENT_ID: ${POLARIS_CLIENT_ID}
+      POLARIS_CLIENT_SECRET: ${POLARIS_CLIENT_SECRET}
+      SHOP_DB_PASSWORD: ${SHOP_DB_PASSWORD}
+    entrypoint: /bin/bash
+    command: ["/opt/airflow/ingestion_dependency.sh"]
+    volumes:
+      - airflow-dags:/opt/airflow/dags
+      - airflow-generated:/opt/airflow/dag_generated_configs
+      - ./dags:/opt/airflow/dags/platform:ro
+      - ./scripts:/opt/datalake/dev:ro
+      - ../../../dbt:/opt/datalake/dbt:ro
+      - datalake-work:/opt/datalake/work
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      openmetadata:
+        condition: service_healthy
+      trino:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  opensearch-data:
+  lake:
+  azurite-data:
+  airflow-dags:
+  airflow-generated:
+  datalake-work:

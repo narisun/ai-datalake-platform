@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import getpass
 import json
 import sys
@@ -12,13 +13,21 @@ from pathlib import Path
 from dotenv import dotenv_values
 
 from datalake import __version__
-from datalake.control.bootstrap import DATABASE_URL, database_url, load_environment, open_store
+from datalake.control.bootstrap import (
+    DATABASE_URL,
+    build_control,
+    database_url,
+    load_environment,
+    open_store,
+)
+from datalake.control.command import run_external
 from datalake.control.errors import ConfigError, ProcessNotRegisteredError
 from datalake.control.ports import ControlStore
 from datalake.control.postgres import apply_migrations
 from datalake.core.errors import DatalakeError
 from datalake.policy.policy_file import load_access_rules
 from datalake.policy.trino_rules import build_trino_rules
+from datalake.transform.command import DocsEngine, TransformSettings, run_transform
 from datalake.transform.dbt_manifest import read_manifest
 
 _ENV_PREFIX = "DL_"
@@ -69,6 +78,14 @@ def _build_parser() -> argparse.ArgumentParser:
     runs = commands.add_parser("runs", help="show recent runs")
     runs.add_argument("--process")
     runs.add_argument("--limit", type=int, default=20)
+
+    # dl transform / dl exec
+    commands.add_parser("transform", help="build the dbt project as the 'transform' process")
+    exec_ = commands.add_parser(
+        "exec", help="run a command as a registered process: dl exec NAME -- COMMAND"
+    )
+    exec_.add_argument("process")
+    exec_.add_argument("cmd", nargs=argparse.REMAINDER, metavar="-- COMMAND")
 
     # dl policy
     policy = commands.add_parser("policy", help="work with the access policy").add_subparsers(
@@ -198,6 +215,20 @@ def _runs(args: argparse.Namespace, store: ControlStore) -> int:
     return 0
 
 
+def _dbt_engine(settings: TransformSettings, run_id: str) -> DocsEngine:
+    # Imported here so that `dl` works without dbt installed for every other command.
+    from datalake.transform.dbt_core_runner import DbtCoreRunner
+
+    return DbtCoreRunner(
+        project_dir=settings.dbt_project_dir,
+        profiles_dir=settings.dbt_profiles_dir or settings.dbt_project_dir,
+        target_dir=settings.dbt_target_dir,
+        log_dir=settings.dbt_log_dir,
+        environment=settings.dbt_environment(),
+        variables={"run_id": run_id},
+    )
+
+
 def main(
     argv: Sequence[str] | None = None,
     *,
@@ -217,6 +248,14 @@ def main(
             return 0
 
         control_store = store if store is not None else open_store(env)
+        if args.command == "transform":
+            result = asyncio.run(run_transform(build_control(env, control_store), _dbt_engine))
+            print(f"transform succeeded: {len(result.models_built)} model(s) built")
+            return 0
+        if args.command == "exec":
+            command = args.cmd[1:] if args.cmd[:1] == ["--"] else args.cmd
+            run_external(build_control(env, control_store), args.process, command, env)
+            return 0
         if args.command == "process":
             return _process(args, control_store)
         if args.command == "config":
